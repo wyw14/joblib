@@ -117,7 +117,13 @@ from ._store_backends import StoreBackendBase
 from .compressor import register_compressor
 from .hashing import hash
 from .logger import Logger, PrintTime
-from .memory import MemorizedResult, Memory, expires_after, register_store_backend
+from .memory import (
+    MemorizedResult,
+    Memory,
+    ResultLease,
+    expires_after,
+    register_store_backend,
+)
 from .numpy_pickle import dump, load
 from .parallel import (
     Parallel,
@@ -133,6 +139,7 @@ __all__ = [
     # On-disk result caching
     "Memory",
     "MemorizedResult",
+    "ResultLease",
     "expires_after",
     # Parallel code execution
     "Parallel",

@@ -25,10 +25,14 @@ import warnings
 import weakref
 
 from . import hashing
+from ._pinning import ResultLease  # noqa: F401 re-exported for users
 from ._store_backends import (
+    GENERATION_BACKEND_NAME,
     CacheWarning,  # noqa
     FileSystemStoreBackend,
+    GenerationFileSystemStoreBackend,
     StoreBackendBase,
+    migrate_legacy_store_to_generation_layout,
 )
 from .func_inspect import (
     filter_args,
@@ -71,7 +75,10 @@ class JobLibCollisionWarning(UserWarning):
     """Warn that there might be a collision between names of functions."""
 
 
-_STORE_BACKENDS = {"local": FileSystemStoreBackend}
+_STORE_BACKENDS = {
+    "local": FileSystemStoreBackend,
+    GENERATION_BACKEND_NAME: GenerationFileSystemStoreBackend,
+}
 
 
 def register_store_backend(backend_name, backend):
@@ -190,6 +197,13 @@ class MemorizedResult(Logger):
 
     timestamp, metadata: string
         for internal use only.
+
+    generation: str or None
+        Identifier of the cache generation this result is bound to. Only set
+        for stores using the generation layout (backend
+        ``'local-generation'``): the result then keeps reading that exact
+        generation even if a recomputation publishes a newer one. ``None`` on
+        the legacy layout, whose behavior is unchanged.
     """
 
     def __init__(
@@ -201,6 +215,7 @@ class MemorizedResult(Logger):
         verbose=0,
         timestamp=None,
         metadata=None,
+        generation=None,
     ):
         Logger.__init__(self)
         self._call_id = call_id
@@ -214,12 +229,27 @@ class MemorizedResult(Logger):
 
         if metadata is not None:
             self.metadata = metadata
+        elif getattr(self.store_backend, "generation_layout", False):
+            self.metadata = self.store_backend.get_metadata(
+                self._call_id, generation=generation
+            )
         else:
             self.metadata = self.store_backend.get_metadata(self._call_id)
 
         self.duration = self.metadata.get("duration", None)
         self.verbose = verbose
         self.timestamp = timestamp
+
+        if getattr(self.store_backend, "generation_layout", False):
+            # Bind the result to the generation it was shelved from. A None
+            # value simply means the item does not exist (yet/anymore).
+            self._generation = (
+                generation
+                if generation is not None
+                else self.store_backend.get_current_generation(self._call_id)
+            )
+        else:
+            self._generation = None
 
     @property
     def func(self):
@@ -233,9 +263,27 @@ class MemorizedResult(Logger):
     def args_id(self):
         return self._call_id[1]
 
+    @property
+    def generation(self):
+        """The pinned cache generation this result reads from, if any."""
+        return self._generation
+
     def get(self):
-        """Read value from cache and return it."""
+        """Read value from cache and return it.
+
+        On a generation-layout store the value is always read from the
+        generation captured when the result was created, so publishing a new
+        generation for the same call never changes what this result returns.
+        """
         try:
+            if getattr(self.store_backend, "generation_layout", False):
+                return self.store_backend.load_item(
+                    self._call_id,
+                    timestamp=self.timestamp,
+                    metadata=self.metadata,
+                    verbose=self.verbose,
+                    generation=self._generation,
+                )
             return self.store_backend.load_item(
                 self._call_id,
                 timestamp=self.timestamp,
@@ -251,13 +299,56 @@ class MemorizedResult(Logger):
             )
             raise new_exc from exc
 
+    def pin(self):
+        """Pin the result's generation and return a cross-process lease.
+
+        While the lease is held, ``reduce_size`` and the various ``clear``
+        operations cannot physically delete the files of this generation,
+        although they can logically invalidate the item. The lease works
+        across independent processes and supports several owners: the
+        generation is reclaimed only once every lease has been released or
+        its owner has died.
+
+        Acquiring a lease is atomic with respect to eviction: it either pins
+        a complete generation or raises a :class:`KeyError` if that
+        generation no longer exists. There is no observable window in which
+        the files exist but are unprotected.
+
+        Only available with the ``'local-generation'`` store backend. Hold
+        the lease for as long as the value is in use, in particular when it
+        was loaded with ``mmap_mode``.
+        """
+        if not getattr(self.store_backend, "generation_layout", False):
+            raise RuntimeError(
+                "Pinning cached results requires the generation layout. "
+                "Create the memory with "
+                "Memory(location, backend='{}') and re-create the cached "
+                "result.".format(GENERATION_BACKEND_NAME)
+            )
+        return self.store_backend.acquire_lease(self._call_id, self._generation)
+
     def clear(self):
         """Clear value from cache"""
         self.store_backend.clear_item(self._call_id)
 
     def __repr__(self):
-        return "{}(location={!r}, call_id={!r})".format(
-            self.__class__.__name__, self.store_backend.location, self._call_id
+        backend_name = getattr(self.store_backend, "name", "local")
+        if backend_name == "local":
+            # Keep the historical representation exactly unchanged.
+            return "{}(location={!r}, call_id={!r})".format(
+                self.__class__.__name__,
+                self.store_backend.location,
+                self._call_id,
+            )
+        return (
+            "{class_name}(location={location!r}, call_id={call_id!r}, "
+            "backend={backend!r}, generation={generation!r})"
+        ).format(
+            class_name=self.__class__.__name__,
+            location=self.store_backend.location,
+            call_id=self._call_id,
+            backend=backend_name,
+            generation=self._generation,
         )
 
     def __getstate__(self):
@@ -992,7 +1083,13 @@ class Memory(Logger):
     backend: str, optional, default='local'
         Type of store backend for reading/writing cache files.
         The 'local' backend is using regular filesystem operations to
-        manipulate data (open, mv, etc) in the backend.
+        manipulate data (open, mv, etc) in the backend. The
+        'local-generation' backend uses the same filesystem operations but
+        stores every recomputation as an immutable generation, which enables
+        cross-process result pinning through
+        :meth:`MemorizedResult.pin`; it must be opted in explicitly and
+        legacy caches are migrated through
+        :meth:`migrate_to_generation_layout` rather than converted silently.
 
     mmap_mode: {None, 'r+', 'r', 'w+', 'c'}, optional
         The memmapping mode used when loading from cache
@@ -1198,17 +1295,66 @@ class Memory(Logger):
             time ago are deleted. Example: to remove files older than 5 days,
             use datetime.timedelta(days=5). Negative timedelta are not
             accepted.
+
+        Returns
+        -------
+        report: dict or None
+            ``None`` when no limit was requested. Otherwise a dictionary
+            describing the enforcement, including the ``deleted`` item paths,
+            the ``protected`` item paths that could not be deleted because
+            they are pinned, the extra bytes still occupied by pinned
+            generations (``pinned_bytes``) and the amount by which each
+            limit remains unmet (``unmet_bytes``, ``unmet_items`` and
+            ``age_unmet``). Pinned content is never force-deleted.
         """
         if self.store_backend is None:
             # No cached results, this function does nothing.
-            return
+            return None
 
         if bytes_limit is None and items_limit is None and age_limit is None:
             # No limitation to impose, returning
-            return
+            return None
 
         # Defers the actual limits enforcing to the store backend.
-        self.store_backend.enforce_store_limits(bytes_limit, items_limit, age_limit)
+        return self.store_backend.enforce_store_limits(
+            bytes_limit, items_limit, age_limit
+        )
+
+    @classmethod
+    def migrate_to_generation_layout(cls, location):
+        """Convert a legacy on-disk cache to the generation layout.
+
+        The generation layout (enabled with
+        ``Memory(location, backend='local-generation')``) stores every
+        recomputation as an immutable generation and supports pinning. This
+        method rewrites an existing legacy cache in place: each legacy item
+        becomes the single ``gen-000001`` generation of its item and keeps
+        its original ``output.pkl`` and ``metadata.json``.
+
+        Caches still using the old cache tree must be updated with
+        :meth:`update_cache_tree` before being migrated.
+
+        Parameters
+        ----------
+        location: str or pathlib.Path
+            The same cache location that would be passed to :class:`Memory`.
+
+        Returns
+        -------
+        n_migrated: int
+            Number of cache items that were converted.
+        """
+        if isinstance(location, pathlib.Path):
+            store_location = str(location)
+        elif isinstance(location, str):
+            store_location = os.path.join(location, "joblib")
+        else:
+            raise TypeError(
+                "location should be a str or pathlib.Path, got {}".format(
+                    type(location)
+                )
+            )
+        return migrate_legacy_store_to_generation_layout(store_location)
 
     def eval(self, func, *args, **kwargs):
         """Eval function func with arguments `*args` and `**kwargs`,
