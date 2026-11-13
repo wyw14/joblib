@@ -4,6 +4,18 @@ Release Notes
 In Development
 --------------
 
+- ``joblib.dump`` gains a ``lazy_arrays`` option writing non-object NumPy
+  arrays in an explicit, versioned chunked format where fixed-size
+  contiguous chunks are compressed independently and described by a
+  self-describing index (shape, dtype, storage order, per-chunk offsets and
+  encoded/decoded lengths). ``joblib.load(..., lazy_arrays=True)`` then
+  returns ``LazyArrayProxy`` objects that read and decode only the chunks
+  intersecting each indexing operation, with a byte-budgeted LRU cache, an
+  independent hard limit on single-chunk decoded size, explicit close
+  semantics and pickle support that reopens and verifies the source file.
+  Legacy files remain readable and explicitly reject lazy requests instead
+  of being silently materialized.
+
 - Fix ``await cached_func.call(...)`` for async functions when caching is
   disabled with ``Memory(location=None)``. The call now awaits the function
   and returns its output with empty metadata.

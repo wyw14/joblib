@@ -9,6 +9,19 @@ import os
 import pickle
 import warnings
 
+from ._lazy_arrays import (
+    _COMPRESSOR_NAMES,
+    DEFAULT_CHUNK_BYTES,
+    ChunkedNumpyArrayWrapper,
+    LazyArrayError,
+    LazyArrayProxy,  # noqa: F401
+    _get_or_create_registered_source,
+    _open_source_from_handle,
+    close_lazy_resources,  # noqa: F401
+    get_lazy_options,  # noqa: F401
+    lazy_options,  # noqa: F401
+    set_lazy_options,  # noqa: F401
+)
 from .backports import make_memmap
 from .compressor import (
     _COMPRESSORS,
@@ -23,9 +36,6 @@ from .compressor import (
     lz4,
     register_compressor,
 )
-
-# For compatibility with old versions of joblib, we need ZNDArrayWrapper
-# to be visible in the current namespace.
 from .numpy_pickle_compat import (
     NDArrayWrapper,
     ZNDArrayWrapper,  # noqa: F401
@@ -36,6 +46,7 @@ from .numpy_pickle_utils import (
     BUFFER_SIZE,
     Pickler,
     Unpickler,
+    _detect_compressor,
     _ensure_native_byte_order,
     _read_bytes,
     _reconstruct,
@@ -323,9 +334,34 @@ class NumpyPickler(Pickler):
 
     dispatch = Pickler.dispatch.copy()
 
-    def __init__(self, fp, protocol=None):
+    def __init__(
+        self,
+        fp,
+        protocol=None,
+        lazy_arrays=False,
+        chunk_size=None,
+        chunk_compressor="zlib",
+    ):
         self.file_handle = fp
         self.buffered = isinstance(self.file_handle, BinaryZlibFile)
+        self.lazy_arrays = lazy_arrays
+        if chunk_size is not None and (
+            not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size <= 0
+        ):
+            raise ValueError(
+                "'chunk_size' must be a strictly positive integer of elements, "
+                "got {!r}.".format(chunk_size)
+            )
+        self.chunk_size = chunk_size
+        if chunk_compressor not in _COMPRESSOR_NAMES:
+            raise ValueError(
+                "Invalid chunk compressor {!r}. Supported values are {}.".format(
+                    chunk_compressor, sorted(_COMPRESSOR_NAMES)
+                )
+            )
+        self.chunk_compressor = chunk_compressor
 
         # By default we want a pickle protocol that only changes with
         # the major python version and not the minor one
@@ -364,6 +400,34 @@ class NumpyPickler(Pickler):
 
         return wrapper
 
+    def _create_chunked_array_wrapper(self, array):
+        """Create a chunked array wrapper for the explicit chunked format."""
+        if array.dtype.hasobject:
+            # Object dtypes must never be flattened to raw bytes: Python
+            # object pointers would be serialized as meaningless numeric
+            # values. Reject explicitly instead.
+            raise LazyArrayError(
+                "lazy_arrays=True cannot persist arrays with object dtype. "
+                "Use lazy_arrays=False to keep the legacy eager "
+                "serialization path."
+            )
+        order = (
+            "F" if (array.flags.f_contiguous and not array.flags.c_contiguous) else "C"
+        )
+        if self.chunk_size is None:
+            chunk_elements = max(1, DEFAULT_CHUNK_BYTES // array.dtype.itemsize)
+        else:
+            chunk_elements = self.chunk_size
+        return ChunkedNumpyArrayWrapper(
+            subclass=type(array),
+            shape=array.shape,
+            order=order,
+            dtype=array.dtype,
+            chunk_elements=chunk_elements,
+            compressor_id=_COMPRESSOR_NAMES[self.chunk_compressor],
+            compress_level=None,
+        )
+
     def save(self, obj):
         """Subclass the Pickler `save` method.
 
@@ -382,6 +446,15 @@ class NumpyPickler(Pickler):
             if type(obj) is self.np.memmap:
                 # Pickling doesn't work with memmapped arrays
                 obj = self.np.asanyarray(obj)
+
+            if self.lazy_arrays:
+                # The explicit chunked format, supporting lazy access on load.
+                wrapper = self._create_chunked_array_wrapper(obj)
+                Pickler.save(self, wrapper)
+                if self.proto >= 4:
+                    self.framer.commit_frame(force=True)
+                wrapper.write_array(obj, self)
+                return
 
             # The array wrapper is pickled instead of the real array.
             wrapper = self._create_array_wrapper(obj)
@@ -424,7 +497,18 @@ class NumpyUnpickler(Unpickler):
 
     dispatch = Unpickler.dispatch.copy()
 
-    def __init__(self, filename, file_handle, ensure_native_byte_order, mmap_mode=None):
+    def __init__(
+        self,
+        filename,
+        file_handle,
+        ensure_native_byte_order,
+        mmap_mode=None,
+        lazy_arrays=False,
+        cache_bytes=None,
+        max_chunk_bytes=None,
+        owns_file_handle=False,
+        lazy_source=None,
+    ):
         # The next line is for backward compatibility with pickle generated
         # with joblib versions less than 0.10.
         self._dirname = os.path.dirname(filename)
@@ -435,12 +519,37 @@ class NumpyUnpickler(Unpickler):
         self.filename = filename
         self.compat_mode = False
         self.ensure_native_byte_order = ensure_native_byte_order
+        self.lazy_arrays = lazy_arrays
+        self.cache_bytes = cache_bytes
+        self.max_chunk_bytes = max_chunk_bytes
+        self.owns_file_handle = owns_file_handle
+        self._lazy_source = lazy_source
         Unpickler.__init__(self, self.file_handle)
         try:
             import numpy as np
         except ImportError:
             np = None
         self.np = np
+
+    def get_lazy_source(self):
+        """Return the shared lazy source, creating it on first use."""
+        if self._lazy_source is None:
+            if not (
+                hasattr(self.file_handle, "seek") and hasattr(self.file_handle, "tell")
+            ):
+                raise LazyArrayError(
+                    "lazy_arrays=True requires a seekable file object; the "
+                    "provided stream does not support seek/tell."
+                )
+            filename = self.filename or None
+            self._lazy_source = _open_source_from_handle(
+                self.file_handle,
+                filename,
+                owns_handle=self.owns_file_handle,
+                cache_bytes=self.cache_bytes,
+                max_chunk_bytes=self.max_chunk_bytes,
+            )
+        return self._lazy_source
 
     def load_build(self):
         """Called to set the state of a newly created object.
@@ -453,27 +562,47 @@ class NumpyUnpickler(Unpickler):
         Unpickler.load_build(self)
 
         # For backward compatibility, we support NDArrayWrapper objects.
-        if isinstance(self.stack[-1], (NDArrayWrapper, NumpyArrayWrapper)):
+        if isinstance(
+            self.stack[-1],
+            (NDArrayWrapper, NumpyArrayWrapper, ChunkedNumpyArrayWrapper),
+        ):
             if self.np is None:
                 raise ImportError(
                     "Trying to unpickle an ndarray, but numpy didn't import correctly"
                 )
             array_wrapper = self.stack.pop()
-            # If any NDArrayWrapper is found, we switch to compatibility mode,
-            # this will be used to raise a DeprecationWarning to the user at
-            # the end of the unpickling.
-            try:
-                if isinstance(array_wrapper, NDArrayWrapper):
-                    self.compat_mode = True
-                    _array_payload = array_wrapper.read(self)
-                else:
-                    _array_payload = array_wrapper.read(
-                        self, self.ensure_native_byte_order
+
+            if isinstance(array_wrapper, ChunkedNumpyArrayWrapper):
+                _array_payload = array_wrapper.read(self, self.ensure_native_byte_order)
+            else:
+                if self.lazy_arrays:
+                    # Explicitly refuse to silently materialize the whole array
+                    # for files that do not carry the chunked format.
+                    raise LazyArrayError(
+                        "lazy_arrays=True requires a file written with the "
+                        "explicit chunked format (dump(..., lazy_arrays=True)). "
+                        "This file uses the legacy contiguous array format, "
+                        "which does not support per-chunk access. Reload it "
+                        "with lazy_arrays=False, or regenerate it with the "
+                        "chunked format."
                     )
-            except ValueError as exc:
-                if str(exc) == "Array can't be memory-mapped: Python objects in dtype.":
-                    raise readPython2Error(exc)
-                raise
+                # If any NDArrayWrapper is found, we switch to compatibility
+                # mode, this will be used to raise a DeprecationWarning to the
+                # user at the end of the unpickling.
+                try:
+                    if isinstance(array_wrapper, NDArrayWrapper):
+                        self.compat_mode = True
+                        _array_payload = array_wrapper.read(self)
+                    else:
+                        _array_payload = array_wrapper.read(
+                            self, self.ensure_native_byte_order
+                        )
+                except ValueError as exc:
+                    if str(exc) == (
+                        "Array can't be memory-mapped: Python objects in dtype."
+                    ):
+                        raise readPython2Error(exc)
+                    raise
 
             self.stack.append(_array_payload)
 
@@ -485,7 +614,15 @@ class NumpyUnpickler(Unpickler):
 # Utility functions
 
 
-def dump(value, filename, compress=0, protocol=None):
+def dump(
+    value,
+    filename,
+    compress=0,
+    protocol=None,
+    lazy_arrays=False,
+    chunk_size=None,
+    chunk_compressor="zlib",
+):
     """Persist an arbitrary Python object into one file.
 
     Read more in the :ref:`User Guide <persistence>`.
@@ -511,6 +648,25 @@ def dump(value, filename, compress=0, protocol=None):
         to the compression level.
     protocol: int, optional
         Pickle protocol, see pickle.dump documentation for more details.
+    lazy_arrays: bool, default=False
+        If True, non-object numpy arrays are persisted in the explicit
+        chunked format: each array is split into contiguous chunks of a
+        fixed upper size, compressed independently and described by a
+        self-describing header carrying the format version, shape, dtype,
+        storage order and a per-chunk (offset, encoded length, decoded
+        length) index. Files written with this flag can be loaded with
+        ``load(..., lazy_arrays=True)`` to get on-demand array proxies.
+        Object dtypes are rejected: they keep using the legacy eager path.
+        Whole-file compression is not allowed with this flag, chunks are
+        compressed individually instead.
+    chunk_size: int, optional
+        Number of array elements stored in each chunk of the chunked
+        format. If None, a size targeting 8 MiB of raw data per chunk is
+        derived from the array itemsize. Ignored when ``lazy_arrays`` is
+        False.
+    chunk_compressor: {'zlib', 'none'}, default='zlib'
+        Per-chunk compression codec used by the chunked format. Ignored
+        when ``lazy_arrays`` is False.
 
     Returns
     -------
@@ -604,6 +760,14 @@ def dump(value, filename, compress=0, protocol=None):
             # as an argument (using compress).
             compress_level = None
 
+    if lazy_arrays and compress_level != 0:
+        raise ValueError(
+            "lazy_arrays=True is incompatible with whole-file compression: "
+            "the chunked format already compresses every array chunk "
+            "independently (see the 'chunk_compressor' argument). Got "
+            "compress={!r}.".format(compress)
+        )
+
     if compress_level != 0:
         with _write_fileobject(
             filename, compress=(compress_method, compress_level)
@@ -611,9 +775,21 @@ def dump(value, filename, compress=0, protocol=None):
             NumpyPickler(f, protocol=protocol).dump(value)
     elif is_filename:
         with open(filename, "wb") as f:
-            NumpyPickler(f, protocol=protocol).dump(value)
+            NumpyPickler(
+                f,
+                protocol=protocol,
+                lazy_arrays=lazy_arrays,
+                chunk_size=chunk_size,
+                chunk_compressor=chunk_compressor,
+            ).dump(value)
     else:
-        NumpyPickler(filename, protocol=protocol).dump(value)
+        NumpyPickler(
+            filename,
+            protocol=protocol,
+            lazy_arrays=lazy_arrays,
+            chunk_size=chunk_size,
+            chunk_compressor=chunk_compressor,
+        ).dump(value)
 
     # If the target container is a file object, nothing is returned.
     if is_fileobj:
@@ -624,7 +800,17 @@ def dump(value, filename, compress=0, protocol=None):
     return [filename]
 
 
-def _unpickle(fobj, ensure_native_byte_order, filename="", mmap_mode=None):
+def _unpickle(
+    fobj,
+    ensure_native_byte_order,
+    filename="",
+    mmap_mode=None,
+    lazy_arrays=False,
+    cache_bytes=None,
+    max_chunk_bytes=None,
+    owns_file_handle=False,
+    lazy_source=None,
+):
     """Internal unpickling function."""
     # We are careful to open the file handle early and keep it open to
     # avoid race-conditions on renames.
@@ -633,7 +819,15 @@ def _unpickle(fobj, ensure_native_byte_order, filename="", mmap_mode=None):
     # will create a race when joblib tries to access the companion
     # files.
     unpickler = NumpyUnpickler(
-        filename, fobj, ensure_native_byte_order, mmap_mode=mmap_mode
+        filename,
+        fobj,
+        ensure_native_byte_order,
+        mmap_mode=mmap_mode,
+        lazy_arrays=lazy_arrays,
+        cache_bytes=cache_bytes,
+        max_chunk_bytes=max_chunk_bytes,
+        owns_file_handle=owns_file_handle,
+        lazy_source=lazy_source,
     )
     obj = None
     try:
@@ -678,7 +872,14 @@ def load_temporary_memmap(filename, mmap_mode, unlink_on_gc_collect):
     return obj
 
 
-def load(filename, mmap_mode=None, ensure_native_byte_order="auto"):
+def load(
+    filename,
+    mmap_mode=None,
+    ensure_native_byte_order="auto",
+    lazy_arrays=False,
+    cache_bytes=None,
+    max_chunk_bytes=None,
+):
     """Reconstruct a Python object from a file persisted with joblib.dump.
 
     Read more in the :ref:`User Guide <persistence>`.
@@ -695,13 +896,36 @@ def load(filename, mmap_mode=None, ensure_native_byte_order="auto"):
         If not None, the arrays are memory-mapped from the disk. This
         mode has no effect for compressed files. Note that in this
         case the reconstructed object might no longer match exactly
-        the originally pickled object.
+        the originally pickled object. This parameter is mutually
+        exclusive with ``lazy_arrays``.
     ensure_native_byte_order: bool, or 'auto', default=='auto'
         If True, ensures that the byte order of the loaded arrays matches the
         native byte ordering (or _endianness_) of the host system. This is not
         compatible with memory-mapped arrays and using non-null `mmap_mode`
         parameter at the same time will raise an error. The default 'auto'
         parameter is equivalent to True if `mmap_mode` is None, else False.
+        Lazy array proxies support native byte order coercion at
+        materialization time, so this option remains compatible with
+        ``lazy_arrays=True``.
+    lazy_arrays: bool, default=False
+        If True, numpy arrays stored in the explicit chunked format are
+        returned as :class:`~joblib._lazy_arrays.LazyArrayProxy` objects
+        instead of being materialized eagerly: only the compressed chunks
+        intersecting an indexing operation are read and decoded. Legacy
+        files without chunk metadata are rejected with an explicit error
+        rather than being silently materialized. The option requires a
+        seekable stream and is mutually exclusive with ``mmap_mode``.
+    cache_bytes: int, optional
+        Maximum number of decoded bytes retained by the LRU chunk cache
+        of each lazy source. If None, the value from
+        :func:`~joblib._lazy_arrays.get_lazy_options` is used. The budget
+        counts the actual bytes kept in the cache, not the number of
+        entries.
+    max_chunk_bytes: int, optional
+        Hard limit on the decoded size of a single chunk. A chunk whose
+        index declaration exceeds this limit is rejected before any
+        output buffer is allocated. If None, the value from
+        :func:`~joblib._lazy_arrays.get_lazy_options` is used.
 
     Returns
     -------
@@ -720,6 +944,11 @@ def load(filename, mmap_mode=None, ensure_native_byte_order="auto"):
     arrays are loaded as memmaps. As a consequence, the reconstructed
     object might not match the original pickled object. Note that if the
     file was saved with compression, the arrays cannot be memmapped.
+
+    When ``lazy_arrays=True`` and ``filename`` is a path, joblib keeps the
+    underlying file handle open and owned by the returned proxies; close
+    them explicitly (or call
+    :func:`~joblib._lazy_arrays.close_lazy_resources`) to release it.
     """
     if ensure_native_byte_order == "auto":
         ensure_native_byte_order = mmap_mode is None
@@ -730,14 +959,88 @@ def load(filename, mmap_mode=None, ensure_native_byte_order="auto"):
             f"is set to None, but got 'mmap_mode={mmap_mode}' instead."
         )
 
+    if lazy_arrays and mmap_mode is not None:
+        raise ValueError(
+            "'lazy_arrays' and 'mmap_mode' are mutually exclusive: lazy "
+            "proxies perform their own on-demand chunk reads and cannot be "
+            "backed by a memory map. Got mmap_mode={!r}.".format(mmap_mode)
+        )
+
+    for option_name, option_value in (
+        ("cache_bytes", cache_bytes),
+        ("max_chunk_bytes", max_chunk_bytes),
+    ):
+        if option_value is not None and (
+            not isinstance(option_value, int)
+            or isinstance(option_value, bool)
+            or option_value <= 0
+        ):
+            raise ValueError(
+                "'{}' must be a strictly positive integer, got {!r}.".format(
+                    option_name, option_value
+                )
+            )
+
     if isinstance(filename, os.PathLike):
         filename = os.fspath(filename)
 
     if hasattr(filename, "read"):
         fobj = filename
         filename = getattr(fobj, "name", "")
+        if lazy_arrays and not _stream_is_seekable(fobj):
+            raise LazyArrayError("lazy_arrays=True requires a seekable file object.")
         with _validate_fileobject_and_memmap(fobj, filename, mmap_mode) as (fobj, _):
-            obj = _unpickle(fobj, ensure_native_byte_order=ensure_native_byte_order)
+            if lazy_arrays and not _stream_is_seekable(fobj):
+                raise LazyArrayError(
+                    "lazy_arrays=True requires a seekable file object."
+                )
+            obj = _unpickle(
+                fobj,
+                ensure_native_byte_order=ensure_native_byte_order,
+                lazy_arrays=lazy_arrays,
+                cache_bytes=cache_bytes,
+                max_chunk_bytes=max_chunk_bytes,
+                owns_file_handle=False,
+            )
+    elif lazy_arrays:
+        # Reuse an already open source for this file when possible; the
+        # underlying handle is owned by the registered source and closed
+        # when the last proxy is released.
+        source = _get_or_create_registered_source(
+            filename, cache_bytes=cache_bytes, max_chunk_bytes=max_chunk_bytes
+        )
+        fobj = source._file_handle
+        try:
+            # A shared source may hold a handle positioned at the end of a
+            # previous unpickle run: rewind before reading the stream again.
+            fobj.seek(0)
+            # Whole-file compressed streams cannot offer random chunk
+            # access; the chunked format is always written uncompressed.
+            if _detect_compressor(fobj) != "not-compressed":
+                raise LazyArrayError(
+                    "lazy_arrays=True requires an uncompressed file written "
+                    "with the explicit chunked format; whole-file compressed "
+                    "or legacy files do not support per-chunk access."
+                )
+            fobj.seek(0)
+            obj = _unpickle(
+                fobj,
+                ensure_native_byte_order=ensure_native_byte_order,
+                filename=source.filename,
+                lazy_arrays=True,
+                cache_bytes=cache_bytes,
+                max_chunk_bytes=max_chunk_bytes,
+                owns_file_handle=True,
+                lazy_source=source,
+            )
+        except BaseException:
+            if source._refcount == 0:
+                source.close()
+            raise
+        if source._refcount == 0:
+            # No chunked array was present in the payload: nothing keeps the
+            # handle alive, close it ourselves.
+            source.close()
     else:
         with open(filename, "rb") as f:
             with _validate_fileobject_and_memmap(f, filename, mmap_mode) as (
@@ -761,3 +1064,13 @@ def load(filename, mmap_mode=None, ensure_native_byte_order="auto"):
                 )
 
     return obj
+
+
+def _stream_is_seekable(fobj):
+    seekable = getattr(fobj, "seekable", None)
+    if seekable is not None:
+        try:
+            return bool(seekable())
+        except (OSError, io.UnsupportedOperation):
+            return False
+    return hasattr(fobj, "seek") and hasattr(fobj, "tell")

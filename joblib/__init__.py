@@ -118,7 +118,15 @@ from .compressor import register_compressor
 from .hashing import hash
 from .logger import Logger, PrintTime
 from .memory import MemorizedResult, Memory, expires_after, register_store_backend
-from .numpy_pickle import dump, load
+from .numpy_pickle import (
+    LazyArrayProxy,
+    close_lazy_resources,
+    dump,
+    get_lazy_options,
+    lazy_options,
+    load,
+    set_lazy_options,
+)
 from .parallel import (
     Parallel,
     cpu_count,
@@ -156,6 +164,12 @@ __all__ = [
     "hash",
     "dump",
     "load",
+    # Lazy (chunked) array persistence
+    "LazyArrayProxy",
+    "close_lazy_resources",
+    "get_lazy_options",
+    "set_lazy_options",
+    "lazy_options",
 ]
 
 
