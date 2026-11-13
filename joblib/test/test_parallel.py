@@ -9,6 +9,7 @@ Test the parallel module.
 import itertools
 import mmap
 import os
+import pickle
 import re
 import sys
 import threading
@@ -45,6 +46,7 @@ from joblib.testing import check_subprocess_call, parametrize, raises, skipif, w
 if mp is not None:
     # Loky is not available if multiprocessing is not
     from joblib.externals.loky import get_reusable_executor
+    from joblib.externals.loky.process_executor import BrokenProcessPool
 
 from queue import Queue
 
@@ -72,7 +74,10 @@ from joblib._parallel_backends import (
 )
 from joblib.parallel import (
     BACKENDS,
+    Failure,
+    Outcome,
     Parallel,
+    Success,
     cpu_count,
     delayed,
     effective_n_jobs,
@@ -144,6 +149,97 @@ def exception_raiser(x, custom_exception=False):
 def interrupt_raiser(x):
     time.sleep(0.05)
     raise KeyboardInterrupt
+
+
+# Helpers for the Parallel(errors="collect") tests. They are defined at
+# module level so that spawn-based process backends can pickle them.
+
+
+class CollectCustomError(Exception):
+    """Regular user exception for the errors='collect' tests."""
+
+
+class UnpicklableCollectError(Exception):
+    """Exception that cannot be pickled, even though it is raised normally."""
+
+    def __reduce__(self):
+        raise TypeError("this exception deliberately refuses to be pickled")
+
+
+class BadStringificationError(Exception):
+    """Exception whose str() and traceback formatting both re-raise."""
+
+    def __str__(self):
+        raise RuntimeError("broken __str__ implementation")
+
+
+def collect_worker(i, fail_indices=(), log=None, delay=0.0):
+    """Record execution, optionally fail, otherwise return a derived value."""
+    if log is not None:
+        log.append(i)
+    if delay:
+        sleep(delay)
+    if i in fail_indices:
+        raise CollectCustomError(f"task {i} failed")
+    return i * 10
+
+
+def returns_exception_object(i):
+    # A returned exception is a plain success value, not a Failure.
+    return ValueError("returned, not raised")
+
+
+def returns_outcome_lookalike_dict(i):
+    # A dict mimicking the wrapper field names must not be treated as one.
+    return {
+        "index": i,
+        "result": "fake-result",
+        "type": "fake-type",
+        "message": "fake-message",
+        "traceback": "fake-traceback",
+    }
+
+
+def raise_unpicklable_error(i):
+    if i == 1:
+        raise UnpicklableCollectError("unpicklable boom")
+    return i
+
+
+def raise_bad_stringification_error(i):
+    if i == 0:
+        raise BadStringificationError("this message is never used")
+    return i
+
+
+def system_exit_task(i):
+    if i == 1:
+        raise SystemExit(3)
+    return i
+
+
+def crash_worker_task(i):
+    # Brutally kill the worker process instead of raising a catchable error.
+    if i == 1:
+        os._exit(1)
+    return i
+
+
+class UnpicklableResult:
+    """Object that cannot be sent back through a process backend."""
+
+    def __reduce__(self):
+        raise TypeError("this result deliberately refuses to be pickled")
+
+
+def return_unpicklable_result(i):
+    if i == 1:
+        return UnpicklableResult()
+    return i
+
+
+def identity_with_arg(i, obj):
+    return i
 
 
 def f(x, y=0, z=0):
@@ -2509,3 +2605,339 @@ def test_set_env_initializer(request) -> None:
     assert os.environ[k1] == "C"
     assert os.environ[k2] == "D"
     assert mylist == [123]
+
+
+###############################################################################
+# Tests for the Parallel(errors="collect") outcome collection mode.
+
+# (backend, return_as) combinations: the multiprocessing backend does not
+# support generator outputs, hence the split between list and generator modes.
+COLLECT_BACKEND_MODES = [(backend, "list") for backend in BACKENDS] + [
+    (backend, return_as)
+    for backend in RETURN_GENERATOR_BACKENDS
+    for return_as in ("generator", "generator_unordered")
+]
+
+
+def test_collect_errors_invalid_value():
+    with raises(ValueError, match="`errors`"):
+        Parallel(n_jobs=1, errors="bogus")
+
+
+def test_collect_errors_outcome_wrappers():
+    # Wrappers are identified by their exact type, never by field names, so
+    # exception values or lookalike dicts cannot be mistaken for outcomes.
+    success = Success(result=ValueError("x"), index=2)
+    failure = Failure(
+        index=3,
+        type="builtins.ValueError",
+        message="boom",
+        traceback="tb text",
+    )
+    assert success.ok and not failure.ok
+    assert success.index == 2 and failure.index == 3
+    assert isinstance(success.result, ValueError)
+    assert not isinstance(ValueError(), Outcome)
+    assert not isinstance({"index": 1, "result": 2, "type": 3}, Outcome)
+
+    # Wrappers only carry plain data and must survive a pickle round trip as
+    # they are sent back by process-based workers.
+    restored_success = pickle.loads(pickle.dumps(success))
+    assert isinstance(restored_success, Success)
+    assert restored_success.index == 2
+    assert isinstance(restored_success.result, ValueError)
+    restored_failure = pickle.loads(pickle.dumps(failure))
+    assert isinstance(restored_failure, Failure)
+    assert (
+        restored_failure.index,
+        restored_failure.type,
+        restored_failure.message,
+        restored_failure.traceback,
+    ) == (3, "builtins.ValueError", "boom", "tb text")
+
+
+@parametrize("backend, return_as", COLLECT_BACKEND_MODES)
+@parametrize("n_jobs", [1, 2])
+def test_collect_errors_modes(backend, return_as, n_jobs):
+    n_tasks = 12
+    fail_indices = (1, 5, 11)
+
+    parallel = Parallel(
+        n_jobs=n_jobs,
+        backend=backend,
+        errors="collect",
+        return_as=return_as,
+        batch_size=2,
+    )
+    output = parallel(
+        delayed(collect_worker)(i, fail_indices=fail_indices) for i in range(n_tasks)
+    )
+    outcomes = list(output)
+
+    # Exactly one outcome per original input, with unique original indices.
+    assert len(outcomes) == n_tasks
+    assert all(isinstance(outcome, Outcome) for outcome in outcomes)
+    assert len({outcome.index for outcome in outcomes}) == n_tasks
+
+    if return_as == "generator_unordered":
+        # Unordered mode only promises the true index on each outcome.
+        assert sorted(o.index for o in outcomes) == list(range(n_tasks))
+    else:
+        # List and ordered generator follow the input order.
+        assert [o.index for o in outcomes] == list(range(n_tasks))
+
+    for outcome in outcomes:
+        if outcome.index in fail_indices:
+            assert isinstance(outcome, Failure)
+            assert not outcome.ok
+            assert outcome.type.endswith("CollectCustomError")
+            assert "joblib.test.test_parallel" in outcome.type
+            assert outcome.message == f"task {outcome.index} failed"
+            assert "CollectCustomError" in outcome.traceback
+            assert "collect_worker" in outcome.traceback
+            # The exception object itself is not transported.
+            assert not hasattr(outcome, "exc")
+        else:
+            assert isinstance(outcome, Success)
+            assert outcome.ok
+            assert outcome.result == outcome.index * 10
+
+    # Progress and statistics are computed on the original task count, and
+    # collected failures never put the parallel in an aborting state.
+    assert parallel.n_dispatched_tasks == n_tasks
+    assert parallel.n_completed_tasks == n_tasks
+    assert not parallel._aborting
+    assert not parallel._exception
+    assert not parallel._aborted
+
+
+@parametrize("backend", PARALLEL_BACKENDS)
+def test_collect_errors_all_batch_items_run_after_failure(backend):
+    # A failure in the middle of a batch must not discard the remaining items
+    # of that batch: every input must be executed exactly once.
+    n_tasks = 8
+    batch_size = 4
+    fail_indices = (1, 2)
+
+    if backend == "threading":
+        execution_log = []
+    else:
+        # Process workers do not share parent memory: use a manager list to
+        # observe the actual execution sequence in the worker processes.
+        manager = mp.Manager()
+        execution_log = manager.list()
+
+    try:
+        parallel = Parallel(
+            n_jobs=2,
+            backend=backend,
+            errors="collect",
+            batch_size=batch_size,
+        )
+        outcomes = parallel(
+            delayed(collect_worker)(i, fail_indices=fail_indices, log=execution_log)
+            for i in range(n_tasks)
+        )
+        assert sorted(execution_log) == list(range(n_tasks))
+    finally:
+        if backend != "threading":
+            manager.shutdown()
+
+    assert [o.index for o in outcomes] == list(range(n_tasks))
+    assert sorted(o.index for o in outcomes if isinstance(o, Failure)) == list(
+        fail_indices
+    )
+    assert all(
+        isinstance(o, Success) and o.result == o.index * 10
+        for o in outcomes
+        if o.index not in fail_indices
+    )
+    assert parallel.n_completed_tasks == n_tasks
+
+
+@parametrize("backend", BACKENDS)
+@parametrize("n_jobs", [1, 2])
+def test_collect_errors_returned_exception_or_dict_is_success(backend, n_jobs):
+    # A returned Exception instance is a value, not a raised failure.
+    outcomes = Parallel(n_jobs=n_jobs, backend=backend, errors="collect")(
+        delayed(returns_exception_object)(i) for i in range(3)
+    )
+    assert all(isinstance(o, Success) and o.ok for o in outcomes)
+    assert all(isinstance(o.result, ValueError) for o in outcomes)
+    assert not any(isinstance(o, Failure) for o in outcomes)
+
+    # A dict using the same field names as the wrappers is not mistaken for
+    # one.
+    outcomes = Parallel(n_jobs=n_jobs, backend=backend, errors="collect")(
+        delayed(returns_outcome_lookalike_dict)(i) for i in range(3)
+    )
+    assert all(isinstance(o, Success) for o in outcomes)
+    assert [o.result["index"] for o in outcomes] == [0, 1, 2]
+    assert all(o.result["type"] == "fake-type" for o in outcomes)
+
+
+@with_multiprocessing
+@parametrize("backend", PROCESS_BACKENDS)
+def test_collect_errors_unpicklable_exception(backend):
+    # The exception object does not need to be picklable: only its type name,
+    # a safe message and the remote traceback are transported as text.
+    parallel = Parallel(n_jobs=2, backend=backend, errors="collect")
+    outcomes = parallel(delayed(raise_unpicklable_error)(i) for i in range(4))
+
+    failure = outcomes[1]
+    assert isinstance(failure, Failure)
+    assert failure.type.endswith("UnpicklableCollectError")
+    assert failure.message == "unpicklable boom"
+    assert "UnpicklableCollectError" in failure.traceback
+    assert "raise_unpicklable_error" in failure.traceback
+    assert all(isinstance(outcomes[i], Success) for i in (0, 2, 3))
+
+    # The pool was not flagged as broken by the unpicklable exception.
+    assert not parallel._aborting
+    assert not parallel._exception
+
+    # It remains usable for subsequent, regular calls.
+    follow_up = Parallel(n_jobs=2, backend=backend)(
+        delayed(square)(i) for i in range(4)
+    )
+    assert follow_up == [0, 1, 4, 9]
+
+
+@parametrize("backend", BACKENDS)
+@parametrize("n_jobs", [1, 2])
+def test_collect_errors_bad_stringification(backend, n_jobs):
+    # When str(exc) or traceback formatting re-raises, finite replacement
+    # texts preserving the exception type are used and the other items are
+    # still reported normally.
+    outcomes = Parallel(n_jobs=n_jobs, backend=backend, errors="collect")(
+        delayed(raise_bad_stringification_error)(i) for i in range(3)
+    )
+
+    failure = outcomes[0]
+    assert isinstance(failure, Failure)
+    assert failure.type.endswith("BadStringificationError")
+    assert isinstance(failure.message, str)
+    assert "BadStringificationError" in failure.message
+    assert isinstance(failure.traceback, str)
+    assert "BadStringificationError" in failure.traceback
+
+    assert [o.index for o in outcomes] == [0, 1, 2]
+    assert all(isinstance(outcomes[i], Success) for i in (1, 2))
+
+
+@parametrize("backend", BACKENDS)
+@parametrize("n_jobs", [1, 2])
+def test_collect_errors_base_exception_still_propagates(backend, n_jobs):
+    # Only Exception subclasses are collected: SystemExit (a BaseException)
+    # keeps the historical abort-and-raise behavior, in both modes.
+    with raises(SystemExit):
+        Parallel(n_jobs=n_jobs, backend=backend, errors="collect")(
+            delayed(system_exit_task)(i) for i in range(4)
+        )
+
+    with raises(SystemExit):
+        Parallel(n_jobs=n_jobs, backend=backend)(
+            delayed(system_exit_task)(i) for i in range(4)
+        )
+
+
+@with_multiprocessing
+def test_collect_errors_worker_crash_still_raises():
+    # A real worker crash is a backend failure, not a collectable task error:
+    # it must not be disguised as a Failure while the pool is broken.
+    with raises(BrokenProcessPool):
+        Parallel(n_jobs=2, backend="loky", errors="collect")(
+            delayed(crash_worker_task)(i) for i in range(6)
+        )
+
+    # The executor is rebuilt and the next Parallel call works as expected.
+    follow_up = Parallel(n_jobs=2, backend="loky", errors="collect")(
+        delayed(square)(i) for i in range(4)
+    )
+    assert [o.result for o in follow_up] == [0, 1, 4, 9]
+
+
+@with_multiprocessing
+def test_collect_errors_serialization_failures_still_raise():
+    # A task that cannot be pickled is an input serialization failure.
+    with raises(PicklingError):
+        Parallel(n_jobs=2, backend="loky", errors="collect")(
+            delayed(identity_with_arg)(i, threading.Lock()) for i in range(3)
+        )
+
+    # A result that cannot be pickled is an output serialization failure:
+    # it must not be silently turned into a Failure.
+    with raises(TypeError):
+        Parallel(n_jobs=2, backend="loky", errors="collect")(
+            delayed(return_unpicklable_result)(i) for i in range(3)
+        )
+
+
+@parametrize("return_as", ["generator", "generator_unordered"])
+def test_collect_errors_generator_early_close_cancels_work(return_as):
+    n_tasks = 20
+    execution_log = []
+
+    parallel = Parallel(
+        n_jobs=2,
+        backend="threading",
+        return_as=return_as,
+        errors="collect",
+    )
+    generator = parallel(
+        delayed(collect_worker)(i, fail_indices=(2,), log=execution_log, delay=0.2)
+        for i in range(n_tasks)
+    )
+
+    first = next(generator)
+    assert isinstance(first, Outcome)
+    generator.close()
+
+    # Give the worker threads enough time to run far more tasks than the
+    # first dispatched batch if draining was incorrectly forced.
+    sleep(1.0)
+    assert len(execution_log) < n_tasks
+    assert parallel._aborting
+
+
+@with_numpy
+@with_multiprocessing
+def test_collect_errors_generator_early_close_releases_memmap(tmpdir):
+    tmpdir = tmpdir.strpath
+
+    with Parallel(
+        n_jobs=2,
+        backend="loky",
+        max_nbytes=1,
+        temp_folder=tmpdir,
+        return_as="generator",
+        errors="collect",
+    ) as parallel:
+        generator = parallel(
+            delayed(check_memmap)(np.random.random(10)) for _ in range(20)
+        )
+        first = next(generator)
+        assert isinstance(first, Outcome)
+        generator.close()
+
+    # Early close must release the temporary memmaps instead of running the
+    # whole input to build a complete list of outcomes.
+    for _ in range(100):
+        if not os.listdir(tmpdir):
+            break
+        sleep(0.1)
+    else:
+        raise AssertionError("temporary memmap resources were not released")
+
+
+def test_collect_errors_default_raise_unchanged():
+    # The default mode keeps raising the first task exception and never wraps
+    # values in outcomes.
+    with raises(CollectCustomError):
+        Parallel(n_jobs=2)(
+            delayed(collect_worker)(i, fail_indices=(1,)) for i in range(4)
+        )
+
+    results = Parallel(n_jobs=2)(delayed(square)(i) for i in range(3))
+    assert results == [0, 1, 4]
+    assert not any(isinstance(result, Outcome) for result in results)

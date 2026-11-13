@@ -52,6 +52,44 @@ In this case the order of the outputs depends on the concurrency of workers
 and is not deterministic, meaning the results can be yielded with a different
 order every time the code is executed.
 
+Collecting errors instead of raising
+====================================
+
+By default, :class:`joblib.Parallel` re-raises the first exception raised by a
+task and aborts the remaining tasks. Passing ``errors="collect"`` instead
+keeps running every task and wraps each of them in a
+:class:`joblib.Success` or :class:`joblib.Failure` outcome, both carrying the
+index of the task in the original input iterable::
+
+    >>> from joblib import Parallel, delayed, Success, Failure
+    >>> def reciprocal(i):
+    ...     if i == 0:
+    ...         raise ZeroDivisionError("zero is not supported")
+    ...     return 1 / i
+    >>> outcomes = Parallel(n_jobs=2, errors="collect")(
+    ...     delayed(reciprocal)(i) for i in range(4)
+    ... )
+    >>> for outcome in outcomes:
+    ...     if isinstance(outcome, Success):
+    ...         print(outcome.index, outcome.result)
+    ...     else:
+    ...         print(outcome.index, outcome.type, outcome.message)
+    0 ZeroDivisionError zero is not supported
+    1 1.0
+    2 0.5
+    3 0.3333333333333333
+
+A :class:`joblib.Failure` only stores the full exception type name, a safe
+message and the traceback captured in the worker as text, so the exception
+object itself does not need to be picklable. Only :class:`Exception`
+instances raised by the task functions are collected:
+:class:`KeyboardInterrupt` and other :class:`BaseException`, serialization
+errors, worker crashes and backend failures still abort the whole call as with
+the default ``errors="raise"`` behavior. The three ``return_as`` modes are
+supported; in the unordered generator mode, each outcome keeps its real input
+index, and closing an output generator early still cancels the unfinished
+tasks.
+
 Thread-based parallelism vs process-based parallelism
 =====================================================
 

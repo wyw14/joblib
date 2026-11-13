@@ -120,7 +120,10 @@ from .logger import Logger, PrintTime
 from .memory import MemorizedResult, Memory, expires_after, register_store_backend
 from .numpy_pickle import dump, load
 from .parallel import (
+    Failure,
+    Outcome,
     Parallel,
+    Success,
     cpu_count,
     delayed,
     effective_n_jobs,
@@ -136,6 +139,9 @@ __all__ = [
     "expires_after",
     # Parallel code execution
     "Parallel",
+    "Outcome",
+    "Success",
+    "Failure",
     "delayed",
     # Not the same as loky.cpu_count(), it also has per-thread limits:
     "cpu_count",

@@ -15,6 +15,7 @@ import queue
 import sys
 import threading
 import time
+import traceback
 import warnings
 import weakref
 from contextlib import nullcontext
@@ -588,11 +589,164 @@ if hasattr(mp, "get_context"):
         DEFAULT_MP_CONTEXT = mp.get_context(method=method)
 
 
+# Supported values for the `errors` parameter of Parallel.
+ERRORS_RAISE = "raise"
+ERRORS_COLLECT = "collect"
+VALID_ERRORS = (ERRORS_RAISE, ERRORS_COLLECT)
+
+
+class Outcome:
+    """Base class for the per-task results returned with ``errors='collect'``.
+
+    Each input task produces exactly one :class:`Outcome`, carrying the
+    ``index`` of the task in the original input iterable. Use ``isinstance``
+    checks rather than field inspection to tell successes and failures apart:
+    this makes it impossible to mistake a user value (for instance an
+    :class:`Exception` instance or a dict with similarly named fields) for a
+    wrapper.
+    """
+
+    __slots__ = ("index",)
+
+    def __init__(self, index):
+        self.index = index
+
+    @property
+    def ok(self):
+        """Whether the wrapped task completed without raising an Exception."""
+        raise NotImplementedError()
+
+
+class Success(Outcome):
+    """A task that completed normally, used with ``errors='collect'``.
+
+    Attributes
+    ----------
+    result: object
+        The value returned by the task, whatever its type (including
+        :class:`Exception` instances).
+    index: int
+        Index of the task in the original input iterable.
+    """
+
+    __slots__ = ("result",)
+
+    def __init__(self, result, index):
+        super().__init__(index)
+        self.result = result
+
+    @property
+    def ok(self):
+        return True
+
+    def __repr__(self):
+        return f"Success(index={self.index!r}, result={self.result!r})"
+
+
+class Failure(Outcome):
+    """A task that raised an :class:`Exception`, used with ``errors='collect'``.
+
+    The original exception object is never transported: only plain text
+    information is kept, so failures can be sent back even when the exception
+    itself is not picklable.
+
+    Attributes
+    ----------
+    index: int
+        Index of the task in the original input iterable.
+    type: str
+        Full qualified name of the exception type, e.g.
+        ``"builtins.ValueError"`` or ``"mypkg.MyError"``.
+    message: str
+        Safe text representation of the exception. If ``str(exc)`` itself
+        raises, a finite replacement text preserving the exception type name
+        is used instead.
+    traceback: str
+        Text of the traceback captured where the exception was raised (in the
+        worker process for process-based backends). If formatting the
+        traceback fails, a finite replacement text preserving the exception
+        type name is used instead.
+    """
+
+    __slots__ = ("type", "message", "traceback")
+
+    def __init__(self, index, type, message, traceback):
+        super().__init__(index)
+        self.type = type
+        self.message = message
+        self.traceback = traceback
+
+    @property
+    def ok(self):
+        return False
+
+    def __repr__(self):
+        return (
+            f"Failure(index={self.index!r}, type={self.type!r}, "
+            f"message={self.message!r})"
+        )
+
+
+def _full_exception_type_name(exc):
+    """Return the full qualified name of the exception type."""
+    exc_type = type(exc)
+    module = getattr(exc_type, "__module__", None) or "builtins"
+    qualname = getattr(exc_type, "__qualname__", exc_type.__name__)
+    if module == "builtins":
+        return qualname
+    return f"{module}.{qualname}"
+
+
+def _safe_exception_message(exc, type_name):
+    """Return str(exc), falling back to finite text if stringification fails."""
+    try:
+        return str(exc)
+    except Exception:
+        return (
+            f"<exception of type {type_name} could not be converted to a "
+            "message: its __str__ method raised>"
+        )
+
+
+def _safe_exception_traceback(exc, type_name):
+    """Format the exception traceback, falling back to finite text on error."""
+    try:
+        return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    except Exception:
+        return (
+            f"<traceback of exception of type {type_name} could not be "
+            "formatted: the exception raised while being formatted>"
+        )
+
+
+def _build_failure(exc, index):
+    """Build a picklable Failure from a live exception.
+
+    Only plain text information is extracted so the exception object itself
+    does not need to be picklable. Each extraction step is guarded: a broken
+    ``__str__`` or traceback formatting must not prevent the other tasks from
+    being reported.
+    """
+    type_name = _full_exception_type_name(exc)
+    return Failure(
+        index=index,
+        type=type_name,
+        message=_safe_exception_message(exc, type_name),
+        traceback=_safe_exception_traceback(exc, type_name),
+    )
+
+
 class BatchedCalls(object):
     """Wrap a sequence of (func, args, kwargs) tuples as a single callable"""
 
     def __init__(
-        self, iterator_slice, backend_and_jobs, reducer_callback=None, pickle_cache=None
+        self,
+        iterator_slice,
+        backend_and_jobs,
+        reducer_callback=None,
+        pickle_cache=None,
+        collect_errors=False,
+        index_start=0,
     ):
         self.items = list(iterator_slice)
         self._size = len(self.items)
@@ -604,12 +758,37 @@ class BatchedCalls(object):
             # nested backends were returned without n_jobs indications.
             self._backend, self._n_jobs = backend_and_jobs, None
         self._pickle_cache = pickle_cache if pickle_cache is not None else {}
+        # When `collect_errors` is True, the exceptions raised by the task
+        # functions themselves are caught one task at a time and returned as
+        # Failure outcomes instead of aborting the whole batch. `index_start`
+        # is the index, in the original input iterable, of the first task of
+        # the batch.
+        self._collect_errors = collect_errors
+        self._index_start = index_start
 
     def __call__(self):
         # Set the default nested backend to self._backend but do not set the
         # change the default number of processes to -1
         with parallel_config(backend=self._backend, n_jobs=self._n_jobs):
-            return [func(*args, **kwargs) for func, args, kwargs in self.items]
+            if not self._collect_errors:
+                return [func(*args, **kwargs) for func, args, kwargs in self.items]
+
+            # Collect mode: catch only the Exceptions raised by the task
+            # function calls themselves. BaseException subclasses
+            # (KeyboardInterrupt, SystemExit, ...) intentionally propagate as
+            # they did before, as do any error raised outside of the function
+            # call. Catching per item ensures that a failing item does not
+            # discard the remaining items of the batch.
+            outcomes = []
+            for position, (func, args, kwargs) in enumerate(self.items):
+                index = self._index_start + position
+                try:
+                    result = func(*args, **kwargs)
+                except Exception as exc:
+                    outcomes.append(_build_failure(exc, index))
+                else:
+                    outcomes.append(Success(result=result, index=index))
+            return outcomes
 
     def __reduce__(self):
         if self._reducer_callback is not None:
@@ -617,7 +796,14 @@ class BatchedCalls(object):
         # no need to pickle the callback.
         return (
             BatchedCalls,
-            (self.items, (self._backend, self._n_jobs), None, self._pickle_cache),
+            (
+                self.items,
+                (self._backend, self._n_jobs),
+                None,
+                self._pickle_cache,
+                self._collect_errors,
+                self._index_start,
+            ),
         )
 
     def __len__(self):
@@ -1037,6 +1223,23 @@ class Parallel(Logger):
         the selected backend will be single-host and thread-based even
         if the user asked for a non-thread based backend with
         :func:`~joblib.parallel_config`.
+    errors: {'raise', 'collect'}, default='raise'
+        How to handle exceptions raised by the task functions themselves:
+
+        - 'raise': the first exception is raised to the caller and the
+          remaining tasks are aborted. This is the historical behavior.
+
+        - 'collect': every task is executed to completion and each input
+          produces exactly one :class:`~joblib.Success` or
+          :class:`~joblib.Failure` outcome, both carrying the original task
+          index. A :class:`~joblib.Failure` only stores the full exception
+          type name, a safe message and the remote traceback as text: the
+          exception object itself does not need to be picklable. Only
+          :class:`Exception` instances raised by the task function are
+          collected. :class:`BaseException` such as
+          :class:`KeyboardInterrupt` or :class:`SystemExit`, task or result
+          serialization errors, worker crashes and backend failures still
+          abort the whole call as with ``errors='raise'``.
     verbose: int, default=0
         The verbosity level: if non zero, progress messages are
         printed. Above 50, the output is sent to stdout.
@@ -1231,10 +1434,18 @@ class Parallel(Logger):
         mmap_mode=default_parallel_config["mmap_mode"],
         prefer=default_parallel_config["prefer"],
         require=default_parallel_config["require"],
+        errors=ERRORS_RAISE,
         **backend_kwargs,
     ):
         # Initiate parent Logger class state
         super().__init__()
+
+        if errors not in VALID_ERRORS:
+            raise ValueError(
+                "Expected `errors` parameter to be equal to "
+                f"{VALID_ERRORS!r}, but got {errors!r} instead."
+            )
+        self.errors = errors
 
         # Interpret n_jobs=None as 'unset'
         if n_jobs is None:
@@ -1529,6 +1740,11 @@ class Parallel(Logger):
                 else:
                     final_batch_size = max(1, len(islice) // n_jobs)
 
+                # All the previously sliced batches have been dispatched as
+                # the local queue was empty, so the global index of the first
+                # task of this new slice is `n_dispatched_tasks`.
+                index_start = self.n_dispatched_tasks
+
                 # enqueue n_jobs batches in a local queue
                 for i in range(0, len(islice), final_batch_size):
                     tasks = BatchedCalls(
@@ -1536,6 +1752,8 @@ class Parallel(Logger):
                         self._backend.get_nested_backend(),
                         self._reducer_callback,
                         self._pickle_cache,
+                        collect_errors=self.errors == ERRORS_COLLECT,
+                        index_start=index_start + i,
                     )
                     self._ready_batches.put(tasks)
 
@@ -1923,7 +2141,20 @@ class Parallel(Logger):
             for func, args, kwargs in iterable:
                 self.n_dispatched_batches += 1
                 self.n_dispatched_tasks += 1
-                res = func(*args, **kwargs)
+                if self.errors == ERRORS_COLLECT:
+                    # Mirror the worker side behavior: only the Exceptions
+                    # raised by the task function call itself are collected
+                    # into Failure outcomes. BaseExceptions propagate to the
+                    # `except BaseException` block below and abort the run.
+                    index = self.n_dispatched_tasks - 1
+                    try:
+                        res = func(*args, **kwargs)
+                    except Exception as exc:
+                        res = _build_failure(exc, index)
+                    else:
+                        res = Success(result=res, index=index)
+                else:
+                    res = func(*args, **kwargs)
                 self.n_completed_tasks += 1
                 self.print_progress()
                 yield res

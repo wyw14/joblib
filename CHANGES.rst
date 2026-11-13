@@ -4,6 +4,16 @@ Release Notes
 In Development
 --------------
 
+- ``Parallel`` now accepts ``errors='collect'`` to collect the
+  :class:`Exception` raised by individual tasks instead of aborting the whole
+  call. Every input then produces exactly one :class:`~joblib.Success` or
+  :class:`~joblib.Failure` outcome, both carrying the original task index;
+  ``Failure`` only stores the exception type name, a safe message and the
+  remote traceback as text so the exception object itself does not need to be
+  picklable. ``BaseException``, serialization errors, worker crashes and
+  backend failures still abort the call as with the default
+  ``errors='raise'`` behavior.
+
 - Fix ``await cached_func.call(...)`` for async functions when caching is
   disabled with ``Memory(location=None)``. The call now awaits the function
   and returns its output with empty metadata.
