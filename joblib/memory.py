@@ -28,6 +28,7 @@ from . import hashing
 from ._store_backends import (
     CacheWarning,  # noqa
     FileSystemStoreBackend,
+    LayeredFileSystemStoreBackend,
     StoreBackendBase,
 )
 from .func_inspect import (
@@ -71,7 +72,10 @@ class JobLibCollisionWarning(UserWarning):
     """Warn that there might be a collision between names of functions."""
 
 
-_STORE_BACKENDS = {"local": FileSystemStoreBackend}
+_STORE_BACKENDS = {
+    "local": FileSystemStoreBackend,
+    "layered": LayeredFileSystemStoreBackend,
+}
 
 
 def register_store_backend(backend_name, backend):
@@ -474,22 +478,58 @@ class MemorizedFunc(Logger):
         Returns True if the function call is in cache and can be used, and
         returns False otherwise.
         """
+        return self._resolve_valid_candidate(call_id) is not None
+
+    def _resolve_valid_candidate(self, call_id):
+        """Resolve the cache candidate to use for this call.
+
+        For a layered store backend, every *complete* candidate is inspected
+        in layer priority order. A candidate rejected by the
+        ``cache_validation_callback`` is simply skipped: a rejected
+        read-only fallback candidate is never deleted, while a rejected
+        candidate in the writable primary layer is cleared, preserving the
+        single-layer semantics. The resolved candidate is returned as a
+        backend-specific descriptor carried on the call stack, so concurrent
+        threads never share a mutable "current layer" state.
+
+        For a regular store backend, the historical single-location lookup
+        is performed unchanged and True is returned on a hit.
+
+        Returns a descriptor (truthy) when a usable candidate exists, and
+        None otherwise.
+        """
         # Check if the code of the function has changed
         if not self._check_previous_func_code(stacklevel=4):
-            return False
+            return None
+
+        backend = self.store_backend
+        if isinstance(backend, LayeredFileSystemStoreBackend):
+            for layer, item_dir in backend.iter_candidates(call_id):
+                metadata = backend.read_metadata(item_dir)
+                if (
+                    self.cache_validation_callback is not None
+                    and not self.cache_validation_callback(metadata)
+                ):
+                    # Skip the rejected candidate. This only deletes from
+                    # the writable primary layer; fallback layers are left
+                    # untouched.
+                    backend.invalidate_candidate(call_id, layer)
+                    continue
+                return layer, item_dir
+            return None
 
         # Check if this specific call is in the cache
-        if not self.store_backend.contains_item(call_id):
-            return False
+        if not backend.contains_item(call_id):
+            return None
 
         # Call the user defined cache validation callback
-        metadata = self.store_backend.get_metadata(call_id)
+        metadata = backend.get_metadata(call_id)
         if (
             self.cache_validation_callback is not None
             and not self.cache_validation_callback(metadata)
         ):
-            self.store_backend.clear_item(call_id)
-            return False
+            backend.clear_item(call_id)
+            return None
 
         return True
 
@@ -540,13 +580,14 @@ class MemorizedFunc(Logger):
         # Compare the function code with the previous to see if the
         # function code has changed and check if the results are present in
         # the cache.
-        if self._is_in_cache_and_valid(call_id):
+        resolved = self._resolve_valid_candidate(call_id)
+        if resolved is not None:
             if shelving:
                 return self._get_memorized_result(call_id), {}
 
             try:
                 start_time = time.time()
-                output = self._load_item(call_id)
+                output = self._load_item(call_id, resolved=resolved)
                 if self._verbose > 4:
                     self._print_duration(
                         time.time() - start_time, context="cache loaded "
@@ -922,7 +963,19 @@ class MemorizedFunc(Logger):
             verbose=self._verbose - 1,
         )
 
-    def _load_item(self, call_id, metadata=None):
+    def _load_item(self, call_id, metadata=None, resolved=None):
+        if isinstance(self.store_backend, LayeredFileSystemStoreBackend) and (
+            resolved is not None
+        ):
+            # Use the exact candidate selected during validation, so a
+            # rejected fallback layer can never be re-selected here.
+            return self.store_backend.load_resolved_item(
+                resolved,
+                call_id,
+                metadata=metadata,
+                timestamp=self.timestamp,
+                verbose=self._verbose,
+            )
         return self.store_backend.load_item(
             call_id, metadata=metadata, timestamp=self.timestamp, verbose=self._verbose
         )
@@ -993,6 +1046,14 @@ class Memory(Logger):
         Type of store backend for reading/writing cache files.
         The 'local' backend is using regular filesystem operations to
         manipulate data (open, mv, etc) in the backend.
+        The 'layered' backend is filesystem-only as well, but combines a
+        writable primary ``location`` with an ordered list of read-only
+        fallback directories given in ``backend_options`` (keys
+        ``fallback`` and ``promote``). A cache hit is only served from a
+        layer that holds the complete candidate (function code, output and
+        metadata) for the call; a call is never assembled from different
+        layers. Writes, ``clear`` and ``reduce_size`` only affect the
+        primary layer, read-only fallback layers are never modified.
 
     mmap_mode: {None, 'r+', 'r', 'w+', 'c'}, optional
         The memmapping mode used when loading from cache

@@ -4,6 +4,15 @@ Release Notes
 In Development
 --------------
 
+- Add a filesystem-only layered store backend (``backend='layered'``) to
+  :class:`~joblib.Memory`, combining a writable primary cache directory with
+  an ordered list of read-only fallback directories. A cache hit is only
+  served from a layer holding a complete candidate (matching function code,
+  ``output.pkl`` and ``metadata.json``); a call is never assembled from
+  different layers. Fallback layers are never modified or deleted, and
+  optional atomic promotion of fallback hits to the primary layer is
+  available through ``backend_options={"promote": True}``.
+
 - Fix ``await cached_func.call(...)`` for async functions when caching is
   disabled with ``Memory(location=None)``. The call now awaits the function
   and returns its output with empty metadata.

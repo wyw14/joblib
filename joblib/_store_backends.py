@@ -6,6 +6,7 @@ import json
 import operator
 import os
 import os.path
+import pathlib
 import shutil
 import threading
 import time
@@ -686,6 +687,600 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
             (
                 self.__class__,
                 self.location,
+                self.verbose,
+                self.compress,
+                self.mmap_mode,
+            ),
+        )
+
+
+def _normalize_layer_path(path):
+    """Return a normalized, absolute path with symlinks resolved, for
+    comparing layer locations independently of spelling/links."""
+    if isinstance(path, pathlib.Path):
+        path = str(path)
+    path = os.path.expanduser(path)
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def _validate_layer_locations(primary_location, fallback_locations):
+    """Validate the layered store configuration.
+
+    Duplicate locations and locations overlapping one another (one being the
+    same directory or nested inside the other, including through symlinks)
+    are rejected with a ``ValueError``.
+    """
+    locations = [primary_location] + list(fallback_locations)
+    normalized = []
+    for location in locations:
+        normalized_location = _normalize_layer_path(location)
+        for existing in normalized:
+            if normalized_location == existing:
+                raise ValueError(
+                    "The same location is configured twice in a layered "
+                    "store backend: %r" % location
+                )
+            if normalized_location.startswith(
+                existing + os.sep
+            ) or existing.startswith(normalized_location + os.sep):
+                raise ValueError(
+                    "Layered store backends cannot use overlapping or "
+                    "nested locations: %r and %r"
+                    % (location, existing)
+                )
+        normalized.append(normalized_location)
+    return normalized
+
+
+def _build_read_only_layer(location, verbose, compress, mmap_mode):
+    """Configure a FileSystemStoreBackend on an existing directory without
+    ever writing into it (no directory creation, no store_backend_info.json
+    write, no .gitignore write), so that genuinely read-only mounts can be
+    used as fallback layers."""
+    backend = FileSystemStoreBackend()
+    backend.location = location
+    backend.compress = compress
+    backend.mmap_mode = mmap_mode
+    backend.verbose = verbose
+
+    cache_version = 2
+    info_path = os.path.join(location, "store_backend_info.json")
+    if os.path.exists(info_path):
+        try:
+            with open(info_path, "rb") as info_file:
+                info = json.loads(info_file.read().decode("utf-8"))
+            cache_version = info.get("cache_version", 2)
+        except (OSError, ValueError):
+            # Unreadable or corrupted info file: default to the current
+            # cache tree and rely on the layer's items being well-formed.
+            pass
+    if cache_version == 1:
+        backend._split_id = types.MethodType(_old_split_id, backend)
+    return backend
+
+
+def _reconstruct_layered_store_backend(
+    location, fallback_locations, promote, verbose, compress, mmap_mode
+):
+    obj = LayeredFileSystemStoreBackend()
+    obj.configure(
+        location,
+        verbose=verbose,
+        backend_options=dict(
+            fallback=list(fallback_locations),
+            promote=promote,
+            compress=compress,
+            mmap_mode=mmap_mode,
+        ),
+    )
+    return obj
+
+
+class LayeredFileSystemStoreBackend(StoreBackendBase):
+    """A filesystem-only store backend combining several cache directories.
+
+    The backend is made of one writable *primary* layer and an ordered list
+    of *read-only fallback* layers. Lookups first query the primary layer and
+    then, in order, each fallback layer. Writes (new computations, metadata,
+    function code, clears and size reductions) always target the primary
+    layer only: fallback directories are never modified nor deleted.
+
+    A cache hit is only served from a layer when that layer alone holds a
+    *complete* candidate for the call: a ``func_code.py`` matching the
+    wrapped function, together with the call's ``output.pkl`` and a valid
+    ``metadata.json``. A single call is never assembled from pieces coming
+    from different layers.
+
+    Parameters understood by ``configure`` through ``backend_options``:
+
+    fallback: str, path-like or list of them, optional
+        Ordered read-only fallback cache directories. Missing directories
+        are skipped (with a warning) instead of being created.
+    promote: bool, optional
+        When True, a candidate loaded from a fallback layer is copied into
+        the primary layer. The whole candidate directory is first copied to
+        a primary-private temporary location and then atomically published,
+        so an interrupted promotion can never leave a half candidate (only
+        an output or only metadata) visible in the primary layer.
+    compress, mmap_mode: same options as FileSystemStoreBackend.
+    """
+
+    _open_item = staticmethod(open)
+    _item_exists = staticmethod(os.path.exists)
+    _move_item = staticmethod(concurrency_safe_rename)
+
+    # Name of the primary-private directory holding in-flight promotions.
+    # It lives outside of any function/call tree, so its contents can never
+    # be mistaken for a cache candidate.
+    _promotion_tmp_dirname = ".promotion_tmp"
+
+    def configure(self, location, verbose=1, backend_options=None):
+        """Configure the layered store.
+
+        ``location`` is the writable primary layer. ``backend_options`` may
+        contain ``fallback`` (ordered read-only locations) and ``promote``
+        (boolean, defaults to False) alongside the usual ``compress`` and
+        ``mmap_mode`` options.
+        """
+        if backend_options is None:
+            backend_options = {}
+
+        fallback = backend_options.get("fallback", [])
+        if fallback is None:
+            fallback = []
+        if isinstance(fallback, (str, pathlib.Path)):
+            fallback = [fallback]
+        fallback = [
+            str(p) if isinstance(p, pathlib.Path) else p for p in fallback
+        ]
+
+        self.promote = bool(backend_options.get("promote", False))
+        self.compress = backend_options.get("compress", False)
+        self.mmap_mode = backend_options.get("mmap_mode")
+        self.verbose = verbose
+
+        if self.compress and self.mmap_mode is not None:
+            warnings.warn(
+                "Compressed items cannot be memmapped in a "
+                "filesystem store. Option will be ignored.",
+                stacklevel=2,
+            )
+
+        # Reject duplicate, overlapping or symlink-nested configurations
+        # before any directory is created.
+        _validate_layer_locations(location, fallback)
+
+        # The primary layer is a regular, writable filesystem store.
+        self.primary = FileSystemStoreBackend()
+        self.primary.configure(
+            location,
+            verbose=verbose,
+            backend_options=dict(
+                compress=self.compress, mmap_mode=self.mmap_mode
+            ),
+        )
+        self.location = self.primary.location
+
+        # Fallback layers are read-only: they are configured without any
+        # write attempt, and directories that do not exist are skipped
+        # rather than created.
+        fallbacks = []
+        for fallback_location in fallback:
+            if not os.path.isdir(fallback_location):
+                warnings.warn(
+                    "Fallback cache directory %r does not exist; ignoring "
+                    "it. No directory was created." % fallback_location,
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
+            fallbacks.append(
+                _build_read_only_layer(
+                    fallback_location,
+                    verbose=verbose,
+                    compress=self.compress,
+                    mmap_mode=self.mmap_mode,
+                )
+            )
+        self.fallbacks = tuple(fallbacks)
+        # Immutable after configuration: every resolution iterates this
+        # tuple with local variables, there is no shared "current layer".
+        self._layers = (self.primary,) + self.fallbacks
+
+        # Per-call locks serializing in-process promotions. Cross-process
+        # safety comes from unique temporary names and atomic renames.
+        self._promotion_locks = {}
+        self._promotion_locks_guard = threading.Lock()
+
+        # Best-effort cleanup of promotions interrupted by a hard crash.
+        # These leftovers are never visible as candidates.
+        tmp_root = os.path.join(
+            self.primary.location, self._promotion_tmp_dirname
+        )
+        if os.path.isdir(tmp_root):
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Candidate resolution. Every method below is stateless and thread
+    # safe: the selected layer and all derived paths are local variables.
+    # ------------------------------------------------------------------
+    def _item_dir(self, layer, call_id):
+        """Real on-disk call directory of ``call_id`` in ``layer``."""
+        return os.path.join(layer.location, *layer._split_id(call_id))
+
+    def _reference_func_code(self, func_id):
+        """Return the stored function code of the highest-priority layer
+        that has one, or None if no layer carries function code."""
+        for layer in self._layers:
+            filename = os.path.join(layer.location, func_id, "func_code.py")
+            try:
+                with open(filename, "rb") as f:
+                    return f.read().decode("utf-8")
+            except OSError:
+                continue
+        return None
+
+    def _is_complete_candidate(self, layer, call_id, reference_func_code):
+        """Check that ``layer`` alone holds a complete candidate.
+
+        The candidate must contain, inside this single layer:
+        - a ``func_code.py`` identical to the reference (itself validated
+          against the wrapped function by MemorizedFunc),
+        - a loadable ``metadata.json`` dictionary,
+        - an ``output.pkl`` file.
+        """
+        item_dir = self._item_dir(layer, call_id)
+        output_filename = os.path.join(item_dir, "output.pkl")
+        metadata_filename = os.path.join(item_dir, "metadata.json")
+        if not (
+            os.path.isfile(output_filename)
+            and os.path.isfile(metadata_filename)
+        ):
+            return False
+
+        try:
+            with open(metadata_filename, "rb") as f:
+                metadata = json.loads(f.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(metadata, dict):
+            return False
+
+        func_code_filename = os.path.join(
+            layer.location, call_id[0], "func_code.py"
+        )
+        try:
+            with open(func_code_filename, "rb") as f:
+                layer_func_code = f.read().decode("utf-8")
+        except OSError:
+            return False
+        return layer_func_code == reference_func_code
+
+    def _resolve_candidate(self, call_id):
+        """Return ``(layer, item_dir)`` of the first complete candidate,
+        in layer priority order, or ``(None, None)`` on a full miss."""
+        for layer, item_dir in self.iter_candidates(call_id):
+            return layer, item_dir
+        return None, None
+
+    def iter_candidates(self, call_id):
+        """Yield ``(layer, item_dir)`` complete candidates in priority order.
+
+        The generator is stateless: iterating it never mutates any shared
+        attribute, so concurrent threads can resolve different calls (and
+        different layers) independently.
+        """
+        reference_func_code = self._reference_func_code(call_id[0])
+        if reference_func_code is None:
+            return
+        for layer in tuple(self._layers):
+            if self._is_complete_candidate(
+                layer, call_id, reference_func_code
+            ):
+                yield layer, self._item_dir(layer, call_id)
+
+    def read_metadata(self, item_dir):
+        """Read metadata from an explicitly resolved candidate directory."""
+        try:
+            with open(os.path.join(item_dir, "metadata.json"), "rb") as f:
+                return json.loads(f.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def invalidate_candidate(self, call_id, layer):
+        """Invalidate a candidate rejected by the validation callback.
+
+        Only the writable primary layer can be modified. A rejected
+        read-only fallback candidate is merely skipped and its directory is
+        never deleted nor altered.
+        """
+        if layer is self.primary:
+            self.primary.clear_item(call_id)
+
+    # ------------------------------------------------------------------
+    # Read operations: always resolve a complete candidate first.
+    # ------------------------------------------------------------------
+    def contains_item(self, call_id):
+        """Check if a complete candidate exists in any layer."""
+        layer, _ = self._resolve_candidate(call_id)
+        return layer is not None
+
+    def get_metadata(self, call_id):
+        """Return the metadata of the resolved candidate, or {} on miss."""
+        layer, item_dir = self._resolve_candidate(call_id)
+        if layer is None:
+            return {}
+        try:
+            with open(os.path.join(item_dir, "metadata.json"), "rb") as f:
+                return json.loads(f.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def get_item_info(self, call_id):
+        """Return the real location of the resolved candidate."""
+        _, item_dir = self._resolve_candidate(call_id)
+        if item_dir is None:
+            item_dir = self._item_dir(self.primary, call_id)
+        return {"location": item_dir}
+
+    def load_item(self, call_id, verbose=1, timestamp=None, metadata=None):
+        """Load an item from the layer holding its complete candidate.
+
+        With ``mmap_mode`` set, the memmap is bound to the real file of the
+        selected layer. No global "current layer" state is involved, so
+        concurrent threads resolving different layers cannot be served the
+        wrong file.
+        """
+        layer, item_dir = self._resolve_candidate(call_id)
+        if layer is None:
+            missing_filename = os.path.join(
+                self._item_dir(self.primary, call_id), "output.pkl"
+            )
+            raise KeyError(
+                "Non-existing item (may have been "
+                "cleared).\nFile %s does not exist" % missing_filename
+            )
+        return self._load_from(
+            layer, item_dir, call_id, verbose, timestamp, metadata
+        )
+
+    def load_resolved_item(
+        self, resolved, call_id, verbose=1, timestamp=None, metadata=None
+    ):
+        """Load the exact candidate previously selected by
+        :meth:`iter_candidates` (e.g. accepted by a validation callback),
+        without re-running the selection against a possibly changed store.
+
+        ``resolved`` is a ``(layer, item_dir)`` tuple. The same candidate
+        identity rules as :meth:`load_item` apply.
+        """
+        layer, item_dir = resolved
+        return self._load_from(
+            layer, item_dir, call_id, verbose, timestamp, metadata
+        )
+
+    def _load_from(
+        self, layer, item_dir, call_id, verbose=1, timestamp=None, metadata=None
+    ):
+        """Load ``output.pkl`` from an explicitly selected layer/directory."""
+        if verbose > 1:
+            ts_string = (
+                "{: <16}".format(format_time(time.time() - timestamp))
+                if timestamp is not None
+                else ""
+            )
+            signature = os.path.basename(call_id[0])
+            if metadata is not None and "input_args" in metadata:
+                kwargs = ", ".join(
+                    "{}={}".format(*item)
+                    for item in metadata["input_args"].items()
+                )
+                signature += "({})".format(kwargs)
+            msg = "[Memory]{}: Loading {}".format(ts_string, signature)
+            if verbose < 10:
+                print("{0}...".format(msg))
+            else:
+                print("{0} from {1}".format(msg, item_dir))
+
+        filename = os.path.join(item_dir, "output.pkl")
+        if self.mmap_mode is None:
+            with layer._open_item(filename, "rb") as f:
+                item = numpy_pickle.load(f)
+        else:
+            # Bind the memmap to the concrete, selected file location.
+            item = numpy_pickle.load(filename, mmap_mode=self.mmap_mode)
+
+        if self.promote and layer is not self.primary:
+            self._promote(call_id, layer, item_dir)
+        return item
+
+    def get_cached_func_code(self, call_id):
+        """Return the function code shared by the highest-priority layer
+        having one, preserving the single-backend contract of raising on
+        absence (MemorizedFunc then (re)writes the code in the primary)."""
+        func_code = self._reference_func_code(call_id[0])
+        if func_code is None:
+            raise FileNotFoundError(
+                os.path.join(self.primary.location, *call_id, "func_code.py")
+            )
+        return func_code
+
+    def get_cached_func_info(self, call_id):
+        """Return the real function directory of the first layer holding
+        it, falling back to the primary location."""
+        for layer in self._layers:
+            func_path = os.path.join(layer.location, *call_id)
+            if os.path.exists(func_path):
+                return {"location": func_path}
+        return {"location": os.path.join(self.primary.location, *call_id)}
+
+    def contains_path(self, call_id):
+        """Check the cached function path in any layer."""
+        for layer in self._layers:
+            if os.path.exists(os.path.join(layer.location, *call_id)):
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Write and deletion operations: primary layer only. Fallback layers
+    # are never written to, cleared or reduced.
+    # ------------------------------------------------------------------
+    def dump_item(self, call_id, item, verbose=1):
+        self.primary.dump_item(call_id, item, verbose=verbose)
+
+    def store_metadata(self, call_id, metadata):
+        self.primary.store_metadata(call_id, metadata)
+
+    def store_cached_func_code(self, call_id, func_code=None):
+        self.primary.store_cached_func_code(call_id, func_code)
+
+    def clear_item(self, call_id):
+        """Clear the item in the primary layer only. A read-only fallback
+        candidate for the same call is left untouched and remains readable
+        on the next lookup."""
+        self.primary.clear_item(call_id)
+
+    def clear_path(self, call_id):
+        """Clear the function path in the primary layer only. Read-only
+        fallback layers are never modified."""
+        self.primary.clear_path(call_id)
+
+    def create_location(self, location):
+        self.primary.create_location(location)
+
+    def clear_location(self, location):
+        self.primary.clear_location(location)
+
+    def get_items(self):
+        """Return the primary layer items only. Fallback items are not
+        accounted for, hence never deleted by size reduction."""
+        return self.primary.get_items()
+
+    def clear(self):
+        """Clear the primary layer only. Read-only fallback layers keep
+        their contents and can still produce cache hits afterwards."""
+        self.primary.clear()
+
+    def enforce_store_limits(self, bytes_limit, items_limit=None, age_limit=None):
+        """Enforce store limits on the primary layer only."""
+        self.primary.enforce_store_limits(
+            bytes_limit, items_limit=items_limit, age_limit=age_limit
+        )
+
+    # ------------------------------------------------------------------
+    # Promotion of a fallback candidate into the primary layer.
+    # ------------------------------------------------------------------
+    def _get_promotion_lock(self, call_id):
+        with self._promotion_locks_guard:
+            lock = self._promotion_locks.get(call_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._promotion_locks[call_id] = lock
+            return lock
+
+    def _promote_func_code(self, func_id, source_layer):
+        """Publish the function code into the primary layer first, using
+        its atomic write, so the primary never lacks code identity once a
+        promoted call directory is visible."""
+        primary_func_code = os.path.join(
+            self.primary.location, func_id, "func_code.py"
+        )
+        if os.path.exists(primary_func_code):
+            return
+        source_func_code = os.path.join(
+            source_layer.location, func_id, "func_code.py"
+        )
+        with open(source_func_code, "rb") as f:
+            func_code = f.read().decode("utf-8")
+        self.primary.store_cached_func_code([func_id], func_code)
+
+    def _promote(self, call_id, source_layer, source_item_dir):
+        """Copy a complete fallback candidate to the primary layer.
+
+        The complete candidate directory is copied to a primary-private
+        unique temporary location and then atomically renamed to its final
+        location: the target therefore only ever appears as a whole,
+        complete candidate. On failure the temporary copy is removed and
+        the untouched fallback candidate keeps serving the call.
+        """
+        lock = self._get_promotion_lock(call_id)
+        with lock:
+            reference_func_code = self._reference_func_code(call_id[0])
+            if self._is_complete_candidate(
+                self.primary, call_id, reference_func_code
+            ):
+                # Another thread or process already promoted it.
+                return
+
+            target_item_dir = self._item_dir(self.primary, call_id)
+            if os.path.exists(target_item_dir):
+                # Defensive: an incomplete target must not shadow the
+                # complete fallback candidate.
+                shutil.rmtree(target_item_dir, ignore_errors=True)
+
+            tmp_root = os.path.join(
+                self.primary.location, self._promotion_tmp_dirname
+            )
+            tmp_item_dir = os.path.join(
+                tmp_root,
+                "{}-{}-{}".format(
+                    uuid.uuid4().hex,
+                    os.getpid(),
+                    id(threading.current_thread()),
+                ),
+            )
+            try:
+                # 1. Function code identity first (atomic file publish).
+                self._promote_func_code(call_id[0], source_layer)
+                # 2. Copy the whole candidate: output.pkl and metadata.json
+                #    travel together inside one directory.
+                mkdirp(tmp_root)
+                shutil.copytree(source_item_dir, tmp_item_dir)
+                # 3. Single atomic directory publication. The target path
+                #    cannot appear with only one of the two files.
+                mkdirp(os.path.dirname(target_item_dir))
+                self._move_item(tmp_item_dir, target_item_dir)
+                # Remove the now-empty, primary-private temporary root.
+                try:
+                    os.rmdir(tmp_root)
+                except OSError:
+                    pass
+            except Exception as e:  # noqa: E722
+                shutil.rmtree(tmp_item_dir, ignore_errors=True)
+                try:
+                    os.rmdir(tmp_root)
+                except OSError:
+                    pass
+                warnings.warn(
+                    "Unable to promote cached item from read-only fallback "
+                    "layer %r to the primary layer. The untouched fallback "
+                    "candidate continues to be used. Exception: %s."
+                    % (source_layer.location, e),
+                    CacheWarning,
+                    stacklevel=2,
+                )
+
+    def __repr__(self):
+        fallback_locations = ", ".join(
+            layer.location for layer in self.fallbacks
+        )
+        return (
+            '{class_name}(location="{location}", '
+            'fallback=[{fallback}], promote={promote})'.format(
+                class_name=self.__class__.__name__,
+                location=self.location,
+                fallback=fallback_locations,
+                promote=self.promote,
+            )
+        )
+
+    def __reduce__(self):
+        return (
+            _reconstruct_layered_store_backend,
+            (
+                self.primary.location,
+                [layer.location for layer in self.fallbacks],
+                self.promote,
                 self.verbose,
                 self.compress,
                 self.mmap_mode,

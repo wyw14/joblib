@@ -271,6 +271,64 @@ The output of the function call is then pickled and saved to a path formatted as
 
 Additional backends will be added in future joblib releases, including a planned SQL backend.
 
+Layered filesystem backend
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``'layered'`` backend combines several filesystem cache directories: one
+writable *primary* layer (the ``location`` of the :class:`~joblib.Memory`
+object) and an ordered list of *read-only fallback* layers, passed through
+``backend_options``::
+
+    >>> memory = Memory(
+    ...     location="/path/to/writable/cache",
+    ...     backend="layered",
+    ...     backend_options={"fallback": [
+    ...         "/path/to/read_only/cache_a",
+    ...         "/path/to/read_only/cache_b",
+    ...     ]},
+    ...     verbose=0,
+    ... )
+
+On a lookup, the primary layer is queried first and the fallback layers are
+then inspected in order. A layer only produces a cache hit when it alone
+contains a *complete* candidate for the call: the function code
+(``func_code.py``) matching the wrapped function, together with the call's
+``output.pkl`` and its ``metadata.json``. A single call is never assembled
+from pieces stored in different layers: an incomplete entry (for example an
+``output.pkl`` without its metadata) is ignored and the next layer is
+inspected. When no layer holds a valid candidate, the function is executed
+normally and its result is written to the primary layer only.
+
+A ``cache_validation_callback`` that rejects a candidate only skips it: the
+next layer is then inspected. Rejected read-only fallback candidates are
+never deleted nor modified; a rejected candidate located in the writable
+primary layer is cleared, preserving the single-layer behavior. If every
+candidate is rejected, the function is recomputed and only the primary layer
+is updated.
+
+Fallback directories are never written to. Configuring a fallback path that
+does not exist emits a warning and skips it instead of creating the
+directory; duplicate, overlapping or nested layer locations (including
+through symbolic links) raise a ``ValueError``.
+
+Optionally, a candidate loaded from a fallback layer can be *promoted* to the
+primary layer by setting ``"promote": True`` in ``backend_options``. The
+complete candidate directory is first copied to a primary-private temporary
+location and then atomically published, so an interrupted promotion can never
+leave a half candidate (only an output or only metadata) visible in the
+primary layer. If the promotion fails, the untouched fallback candidate keeps
+serving the call.
+
+With ``mmap_mode`` set, memory-mapped arrays are bound to the real file of
+the layer that was selected for each call, so concurrent calls resolving
+different layers never read the wrong file.
+
+Note that :meth:`~joblib.Memory.clear` and :meth:`~joblib.Memory.reduce_size`
+only act on the writable primary layer. They never delete anything from the
+read-only fallback layers, which can therefore still produce cache hits
+afterwards. A read-only fallback does not prevent computations: cache misses
+are always recomputed and stored in the primary layer.
+
 Gotchas
 -------
 
