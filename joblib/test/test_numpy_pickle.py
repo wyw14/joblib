@@ -38,6 +38,7 @@ from joblib.compressor import (
 )
 from joblib.numpy_pickle_utils import (
     _IO_BUFFER_SIZE,
+    BUFFER_SIZE,
     _detect_compressor,
     _ensure_native_byte_order,
 )
@@ -1366,3 +1367,476 @@ def test_memmap_alignment_padding(tmpdir, protocol):
         np.testing.assert_array_equal(array_dict[key], memmap)
         assert memmap.ctypes.data % numpy_pickle.NUMPY_ARRAY_ALIGNMENT_BYTES == 0
         assert memmap.flags.aligned
+
+
+###############################################################################
+# Tests for the out_arrays parameter of joblib.load
+
+
+@with_numpy
+@parametrize("compress", [0, ("zlib", 3), ("gzip", 1)])
+def test_load_out_arrays_identity_and_values(tmpdir, compress):
+    # A matched destination is filled in place: the returned object is the
+    # exact same array, sharing its memory, with no copy of the full data.
+    filename = tmpdir.join("test_out_arrays.pkl").strpath
+    rnd = np.random.RandomState(0)
+    array = rnd.random_sample((20, 7))
+    numpy_pickle.dump(array, filename, compress=compress)
+
+    destination = np.empty_like(array)
+    with warnings.catch_warnings():
+        # No unused-index warning is emitted when every index is used.
+        warnings.simplefilter("error")
+        result = numpy_pickle.load(filename, out_arrays={0: destination})
+
+    assert result is destination
+    assert np.shares_memory(result, destination)
+    np.testing.assert_array_equal(result, array)
+
+    # The same guarantee holds when loading from an in-memory file object,
+    # including through a compressed stream.
+    stream = io.BytesIO()
+    numpy_pickle.dump(array, stream, compress=compress)
+    stream.seek(0)
+    in_memory_destination = np.empty_like(array)
+    in_memory_result = numpy_pickle.load(stream, out_arrays={0: in_memory_destination})
+    assert in_memory_result is in_memory_destination
+    np.testing.assert_array_equal(in_memory_result, array)
+
+
+@with_numpy
+@parametrize("compress", [0, ("zlib", 3)])
+def test_load_out_arrays_mixed_containers(tmpdir, compress):
+    # Indices follow the actual NumpyArrayWrapper occurrence order across
+    # nested containers; unspecified arrays keep the regular loading path.
+    filename = tmpdir.join("test_out_arrays_mixed.pkl").strpath
+    a0 = np.arange(6).reshape(2, 3)
+    a1 = np.arange(10, dtype=np.int32)
+    a2 = np.linspace(0, 1, 12).reshape(3, 4)
+    a3 = np.arange(5, dtype=np.uint8)
+    obj = {"first": [a0, (a1, a2)], "second": a3}
+    numpy_pickle.dump(obj, filename, compress=compress)
+
+    d0 = np.empty_like(a0)
+    d3 = np.empty_like(a3)
+    result = numpy_pickle.load(filename, out_arrays={0: d0, 3: d3})
+
+    # Occurrence order is a0, a1, a2, a3 following the container traversal.
+    assert result["first"][0] is d0
+    assert result["second"] is d3
+    assert np.shares_memory(result["first"][0], d0)
+    assert np.shares_memory(result["second"], d3)
+
+    # Unspecified arrays are reconstructed through the regular path and do
+    # not alias any of the provided destinations.
+    assert result["first"][1][0] is not d0
+    assert result["first"][1][0] is not d3
+    assert result["first"][1][1] is not d0
+    np.testing.assert_array_equal(result["first"][0], a0)
+    np.testing.assert_array_equal(result["first"][1][0], a1)
+    np.testing.assert_array_equal(result["first"][1][1], a2)
+    np.testing.assert_array_equal(result["second"], a3)
+
+
+@with_numpy
+def test_load_out_arrays_repeated_source_array(tmpdir):
+    # Each occurrence is serialized independently and gets its own index,
+    # even when both occurrences come from the very same source array.
+    filename = tmpdir.join("test_out_arrays_repeated.pkl").strpath
+    array = np.arange(8, dtype=np.int64)
+    numpy_pickle.dump([array, array], filename)
+
+    d0 = np.empty_like(array)
+    d1 = np.empty_like(array)
+    result = numpy_pickle.load(filename, out_arrays={0: d0, 1: d1})
+
+    assert result[0] is d0
+    assert result[1] is d1
+    # The two destinations are independent: no shared view/alias is restored.
+    assert not np.shares_memory(result[0], result[1])
+    np.testing.assert_array_equal(result[0], array)
+    np.testing.assert_array_equal(result[1], array)
+
+    # The regular path also reconstructs two independent arrays.
+    regular_result = numpy_pickle.load(filename)
+    assert not np.shares_memory(regular_result[0], regular_result[1])
+
+
+@with_numpy
+@parametrize("compress", [0, ("zlib", 3)])
+def test_load_out_arrays_fortran_order(tmpdir, compress):
+    # An F-order stream must be filled into an F-contiguous destination,
+    # preserving strides, values and object identity.
+    filename = tmpdir.join("test_out_arrays_fortran.pkl").strpath
+    rnd = np.random.RandomState(1)
+    array = np.asfortranarray(rnd.random_sample((4, 5)))
+    assert array.flags.f_contiguous
+    numpy_pickle.dump(array, filename, compress=compress)
+
+    destination = np.empty(array.shape, dtype=array.dtype, order="F")
+    result = numpy_pickle.load(filename, out_arrays={0: destination})
+    assert result is destination
+    assert result.flags.f_contiguous
+    assert result.strides == array.strides
+    np.testing.assert_array_equal(result, array)
+
+    # A C-contiguous destination cannot be used for an F-order stream.
+    c_destination = np.empty(array.shape, dtype=array.dtype, order="C")
+    with raises(ValueError, match="F-contiguous"):
+        numpy_pickle.load(filename, out_arrays={0: c_destination})
+
+    # A 1-D array is both C- and F-contiguous, so either layout is accepted.
+    flat_filename = tmpdir.join("test_out_arrays_flat.pkl").strpath
+    flat_array = np.arange(12, dtype=np.float32)
+    numpy_pickle.dump(flat_array, flat_filename, compress=compress)
+    flat_destination = np.empty_like(flat_array, order="F")
+    flat_result = numpy_pickle.load(flat_filename, out_arrays={0: flat_destination})
+    assert flat_result is flat_destination
+    np.testing.assert_array_equal(flat_result, flat_array)
+
+
+@with_numpy
+@parametrize("compress", [0, ("zlib", 3)])
+def test_load_out_arrays_chunked_filling(tmpdir, compress):
+    # Arrays larger than the read chunk size (and, for compressed streams,
+    # larger than the IO buffer) are filled through several bounded chunks.
+    filename = tmpdir.join("test_out_arrays_chunked.pkl").strpath
+    c_array = np.arange(BUFFER_SIZE + 5000, dtype=np.uint8)
+    f_array = np.asfortranarray(np.arange(200000, dtype=np.int32).reshape(100, 2000))
+    # Larger than the 1 MiB IO buffer used on compressed file objects.
+    big_array = np.arange(2 * _IO_BUFFER_SIZE + 123, dtype=np.uint8)
+    numpy_pickle.dump([c_array, f_array, big_array], filename, compress=compress)
+
+    d0 = np.empty_like(c_array)
+    d1 = np.empty_like(f_array, order="F")
+    d2 = np.empty_like(big_array)
+    result = numpy_pickle.load(filename, out_arrays={0: d0, 1: d1, 2: d2})
+
+    assert result[0] is d0
+    assert result[1] is d1
+    assert result[2] is d2
+    np.testing.assert_array_equal(result[0], c_array)
+    np.testing.assert_array_equal(result[1], f_array)
+    np.testing.assert_array_equal(result[2], big_array)
+
+
+@with_numpy
+def test_load_out_arrays_structured_dtype(tmpdir):
+    # Structured dtypes, including aligned and Fortran layouts, are filled
+    # directly with the exact field layout preserved.
+    filename = tmpdir.join("test_out_arrays_structured.pkl").strpath
+    structured = np.zeros(
+        (3, 2),
+        dtype=np.dtype([("a", "<i4"), ("b", "=f8")], align=True),
+    )
+    structured["a"] = np.arange(6).reshape(3, 2)
+    structured["b"] = np.arange(6, dtype=np.float64).reshape(3, 2)
+    f_structured = np.asfortranarray(
+        np.zeros((4, 5), dtype=np.dtype([("x", "u1"), ("y", "<i8")]))
+    )
+    f_structured["y"] = np.arange(20).reshape(4, 5)
+    numpy_pickle.dump([structured, f_structured], filename)
+
+    d0 = np.empty_like(structured)
+    d1 = np.empty_like(f_structured, order="F")
+    result = numpy_pickle.load(filename, out_arrays={0: d0, 1: d1})
+
+    assert result[0] is d0
+    assert result[1] is d1
+    assert result[0].dtype == structured.dtype
+    assert result[1].dtype == f_structured.dtype
+    np.testing.assert_array_equal(result[0], structured)
+    np.testing.assert_array_equal(result[1], f_structured)
+
+
+@with_numpy
+def test_load_out_arrays_non_native_byte_order(tmpdir):
+    # Native byte-order coercion happens per chunk inside the destination:
+    # the destination object is never replaced by a byte-swapped copy.
+    foreign = ">" if sys.byteorder == "little" else "<"
+    array = np.arange(100, dtype=foreign + "i4").reshape(10, 10)
+    filename = tmpdir.join("test_out_arrays_endianness.pkl").strpath
+    numpy_pickle.dump(array, filename)
+
+    native_destination = np.empty(array.shape, dtype="=i4")
+    native_result = numpy_pickle.load(
+        filename,
+        ensure_native_byte_order=True,
+        out_arrays={0: native_destination},
+    )
+    assert native_result is native_destination
+    assert native_result.dtype == np.dtype("=i4")
+    np.testing.assert_array_equal(native_result, np.arange(100).reshape(10, 10))
+
+    # With coercion disabled, the destination must carry the raw on-disk
+    # dtype and the original bytes are preserved.
+    foreign_destination = np.empty(array.shape, dtype=foreign + "i4")
+    foreign_result = numpy_pickle.load(
+        filename,
+        ensure_native_byte_order=False,
+        out_arrays={0: foreign_destination},
+    )
+    assert foreign_result is foreign_destination
+    assert foreign_result.dtype == np.dtype(foreign + "i4")
+    np.testing.assert_array_equal(foreign_result.view("uint8"), array.view("uint8"))
+
+    # Incompatible endianness choices are rejected before writing.
+    with raises(ValueError, match="dtype"):
+        numpy_pickle.load(
+            filename,
+            ensure_native_byte_order=False,
+            out_arrays={0: np.empty(array.shape, dtype="=i4")},
+        )
+    with raises(ValueError, match="dtype"):
+        numpy_pickle.load(
+            filename,
+            ensure_native_byte_order=True,
+            out_arrays={0: np.empty(array.shape, dtype=foreign + "i4")},
+        )
+
+    # The chunked coercion also works through a compressed stream.
+    stream = io.BytesIO()
+    numpy_pickle.dump(array, stream, compress=("zlib", 3))
+    stream.seek(0)
+    compressed_destination = np.empty(array.shape, dtype="=i4")
+    compressed_result = numpy_pickle.load(
+        stream,
+        ensure_native_byte_order=True,
+        out_arrays={0: compressed_destination},
+    )
+    assert compressed_result is compressed_destination
+    np.testing.assert_array_equal(compressed_result, np.arange(100).reshape(10, 10))
+
+
+@with_numpy
+def test_load_out_arrays_scalar_and_zero_length(tmpdir):
+    # 0-d and zero-length arrays are compatible with the direct-fill path.
+    filename = tmpdir.join("test_out_arrays_scalar_empty.pkl").strpath
+    scalar = np.array(1.25, dtype=np.float32)
+    empty = np.empty((0, 3), dtype=np.int16)
+    numpy_pickle.dump([scalar, empty], filename)
+
+    d0 = np.array(0.0, dtype=np.float32)
+    d1 = np.empty((0, 3), dtype=np.int16)
+    result = numpy_pickle.load(filename, out_arrays={0: d0, 1: d1})
+
+    assert result[0] is d0
+    assert result[1] is d1
+    assert result[0].shape == ()
+    assert result[0] == np.float32(1.25)
+    assert result[1].shape == (0, 3)
+    assert result[1].dtype == np.int16
+
+
+@with_numpy
+def test_load_out_arrays_memmap_destination(tmpdir):
+    # A caller-owned memmap is filled directly; joblib must not close or
+    # delete its backing file and must return the memmap object itself.
+    pickle_filename = tmpdir.join("test_out_arrays_memmap.pkl").strpath
+    memmap_filename = tmpdir.join("destination.mmap").strpath
+    array = np.arange(6, dtype=np.float64)
+    numpy_pickle.dump(array, pickle_filename)
+
+    destination = np.memmap(
+        memmap_filename, mode="w+", shape=array.shape, dtype=array.dtype
+    )
+    result = numpy_pickle.load(pickle_filename, out_arrays={0: destination})
+
+    assert result is destination
+    assert isinstance(result, np.memmap)
+    assert result._mmap is not None  # the mapping is still open
+    np.testing.assert_array_equal(np.asarray(result), array)
+    assert os.path.exists(memmap_filename)
+
+    del result, destination
+    # The backing file still exists after the caller-side memmap is dropped.
+    assert os.path.exists(memmap_filename)
+
+
+@with_numpy
+def test_load_out_arrays_invalid_arguments(tmpdir):
+    # Static validation rejects bad destinations before the stream is read.
+    filename = tmpdir.join("test_out_arrays_invalid.pkl").strpath
+    numpy_pickle.dump(np.arange(8).reshape(2, 4), filename)
+
+    read_only = np.empty((2, 4), dtype=np.int64)
+    read_only.setflags(write=False)
+    non_contiguous = np.ones((4, 6), dtype=np.int64)[::2]
+    assert not non_contiguous.flags.c_contiguous
+    assert not non_contiguous.flags.f_contiguous
+    base = np.empty(10, dtype=np.int64)
+
+    invalid_out_arrays = [
+        read_only,  # read-only destination
+        non_contiguous,  # neither C- nor F-contiguous
+        np.empty(2, dtype=object),  # object dtype
+    ]
+    for destination in invalid_out_arrays:
+        with raises(ValueError):
+            numpy_pickle.load(filename, out_arrays={0: destination})
+
+    # Overlapping destinations are rejected.
+    with raises(ValueError, match="share memory"):
+        numpy_pickle.load(filename, out_arrays={0: base, 1: base[2:5]})
+
+    # Invalid indices and values.
+    with raises(ValueError):
+        numpy_pickle.load(filename, out_arrays={-1: np.empty((2, 4))})
+    with raises(TypeError):
+        numpy_pickle.load(filename, out_arrays={"0": np.empty((2, 4))})
+    with raises(TypeError):
+        numpy_pickle.load(filename, out_arrays={0: [1, 2, 3, 4]})
+    with raises(TypeError):
+        numpy_pickle.load(filename, out_arrays={(np.arange(8),)})
+
+
+@with_numpy
+def test_load_out_arrays_stream_metadata_mismatch(tmpdir):
+    # Per-occurrence validation rejects shape, dtype and order mismatches
+    # before any payload byte is written into the destination.
+    filename = tmpdir.join("test_out_arrays_mismatch.pkl").strpath
+    array = np.arange(12, dtype=np.int64).reshape(3, 4)
+    numpy_pickle.dump(array, filename)
+
+    with raises(ValueError, match="shape"):
+        numpy_pickle.load(filename, out_arrays={0: np.empty((3, 3), dtype=np.int64)})
+
+    dtype_destination = np.full((3, 4), -1, dtype=np.float64)
+    with raises(ValueError, match="dtype"):
+        numpy_pickle.load(filename, out_arrays={0: dtype_destination})
+    # Rejected before writing: the sentinel content is untouched.
+    assert (dtype_destination == -1).all()
+
+    order_destination = np.asfortranarray(np.full((3, 4), -1, dtype=np.int64))
+    with raises(ValueError, match="C-contiguous"):
+        numpy_pickle.load(filename, out_arrays={0: order_destination})
+    assert (np.asarray(order_destination) == -1).all()
+
+    # An object-dtype stream cannot be routed to a destination either.
+    object_filename = tmpdir.join("test_out_arrays_object.pkl").strpath
+    numpy_pickle.dump(np.array([1, "a"], dtype=object), object_filename)
+    with raises(ValueError, match="object dtype"):
+        numpy_pickle.load(object_filename, out_arrays={0: np.empty(2, dtype=object)})
+
+
+@with_numpy
+def test_load_out_arrays_unused_indices_warning(tmpdir):
+    # Indices that no stream array matches are reported at stream end.
+    filename = tmpdir.join("test_out_arrays_unused.pkl").strpath
+    numpy_pickle.dump([np.arange(4), np.arange(2)], filename)
+
+    d0 = np.empty(4, dtype=np.arange(4).dtype)
+    d2 = np.empty(3, dtype=np.arange(4).dtype)
+    d5 = np.empty(1, dtype=np.arange(4).dtype)
+    with warns(UserWarning, match=r"did not match.*\[2, 5\]"):
+        result = numpy_pickle.load(filename, out_arrays={0: d0, 2: d2, 5: d5})
+
+    # The matched index is still filled normally.
+    assert result[0] is d0
+    np.testing.assert_array_equal(result[0], np.arange(4))
+
+
+@with_numpy
+def test_load_out_arrays_truncated_payload_non_transactional(tmpdir):
+    # A truncated stream raises and load never returns a partially
+    # reconstructed object, but the already-filled destination may have been
+    # partially rewritten: the operation is explicitly non-transactional.
+    filename = tmpdir.join("test_out_arrays_truncated.pkl").strpath
+    array = np.arange(100000, dtype=np.int64)
+    numpy_pickle.dump(array, filename)
+
+    file_size = os.path.getsize(filename)
+    with open(filename, "r+b") as f:
+        f.truncate(file_size - 4096)
+
+    destination = np.full_like(array, -1)
+    with raises(ValueError, match="EOF"):
+        numpy_pickle.load(filename, out_arrays={0: destination})
+
+    # The first chunks were written while the tail keeps the sentinel,
+    # demonstrating the partial (non-rolled-back) rewrite.
+    assert destination[0] == 0
+    assert destination[-1] == -1
+
+
+@with_numpy
+@parametrize("compress", [0, ("zlib", 3)])
+def test_load_out_arrays_no_full_size_temporary(tmpdir, monkeypatch, compress):
+    # Record every numpy allocation during loading: the out_arrays path must
+    # never allocate a temporary array of the full payload size, and read
+    # buffers stay bounded by BUFFER_SIZE.
+    filename = tmpdir.join("test_out_arrays_allocations.pkl").strpath
+    array = np.arange(2 * BUFFER_SIZE + 5000, dtype=np.uint8)
+    assert array.nbytes > BUFFER_SIZE
+    numpy_pickle.dump(array, filename, compress=compress)
+
+    empty_allocations = []
+    frombuffer_allocations = []
+    real_empty = np.empty
+    real_frombuffer = np.frombuffer
+
+    def tracking_empty(shape, dtype=float, order="C", *args, **kwargs):
+        allocated = real_empty(shape, dtype=dtype, order=order, *args, **kwargs)
+        empty_allocations.append(allocated.nbytes)
+        return allocated
+
+    def tracking_frombuffer(buffer, dtype=float, count=-1, *args, **kwargs):
+        allocated = real_frombuffer(buffer, dtype=dtype, count=count, *args, **kwargs)
+        frombuffer_allocations.append(allocated.nbytes)
+        return allocated
+
+    monkeypatch.setattr(np, "empty", tracking_empty)
+    monkeypatch.setattr(np, "frombuffer", tracking_frombuffer)
+
+    destination = np.empty_like(array)
+    result = numpy_pickle.load(filename, out_arrays={0: destination})
+    assert result is destination
+
+    # No full-array-sized temporary is allocated on the direct-fill path.
+    assert all(size < array.nbytes for size in empty_allocations)
+    # The transient work buffers are bounded by the configured chunk size.
+    assert max(frombuffer_allocations) <= BUFFER_SIZE
+    np.testing.assert_array_equal(result, array)
+
+    # Control case: the regular loading path does allocate the full array via
+    # np.empty, proving the tracker would have caught such an allocation.
+    regular_result = numpy_pickle.load(filename)
+    assert any(size >= array.nbytes for size in empty_allocations)
+    np.testing.assert_array_equal(regular_result, array)
+
+
+@with_numpy
+def test_load_out_arrays_with_mmap_mode(tmpdir):
+    # mmap_mode only governs arrays not listed in out_arrays: matched arrays
+    # are filled directly while the others are still memory-mapped.
+    filename = tmpdir.join("test_out_arrays_mmap_mode.pkl").strpath
+    a0 = np.arange(6, dtype=np.float64).reshape(2, 3)
+    a1 = np.arange(4, dtype=np.float64)
+    numpy_pickle.dump([a0, a1], filename)
+
+    destination = np.empty_like(a0)
+    result = numpy_pickle.load(filename, mmap_mode="r", out_arrays={0: destination})
+
+    assert result[0] is destination
+    assert isinstance(result[1], np.memmap)
+    np.testing.assert_array_equal(result[0], a0)
+    np.testing.assert_array_equal(np.asarray(result[1]), a1)
+
+
+@with_numpy
+def test_load_out_arrays_sequence_input(tmpdir):
+    # A sequence is accepted, with None entries marking unused indices.
+    filename = tmpdir.join("test_out_arrays_sequence.pkl").strpath
+    arrays = [np.arange(3, dtype=np.int32), np.arange(5), np.arange(2)]
+    numpy_pickle.dump(arrays, filename)
+
+    d0 = np.empty(3, dtype=np.int32)
+    d2 = np.empty(2, dtype=arrays[2].dtype)
+    result = numpy_pickle.load(filename, out_arrays=[d0, None, d2])
+
+    assert result[0] is d0
+    assert result[2] is d2
+    assert result[1] is not d0 and result[1] is not d2
+    np.testing.assert_array_equal(result[0], arrays[0])
+    np.testing.assert_array_equal(result[1], arrays[1])
+    np.testing.assert_array_equal(result[2], arrays[2])

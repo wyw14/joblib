@@ -4,6 +4,14 @@ Release Notes
 In Development
 --------------
 
+- ``joblib.load`` gains an ``out_arrays`` parameter accepting pre-allocated
+  writable ``numpy.ndarray`` or ``numpy.memmap`` destinations, numbered by the
+  order in which the numpy arrays occur in the stream. Matched arrays are
+  filled directly into the provided buffers in bounded chunks (including for
+  compressed files), preserving destination object identity instead of
+  allocating a full-size temporary array, with validation of shape, dtype,
+  endianness, order, capacity, writability and memory overlap.
+
 - Fix ``await cached_func.call(...)`` for async functions when caching is
   disabled with ``Memory(location=None)``. The call now awaits the function
   and returns its output with empty metadata.
